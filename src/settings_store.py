@@ -32,7 +32,9 @@ EDITABLE_PATHS: list[tuple[str, ...]] = [
     ("risk", "max_risk_per_trade_pct"),
     ("risk", "daily_max_loss_pct"),
     ("llm", "enabled"),
+    ("llm", "primary_provider"),
     ("llm", "confidence_threshold"),
+    ("llm", "watchlist_interval_minutes"),
     ("briefing", "enabled"),
 ]
 

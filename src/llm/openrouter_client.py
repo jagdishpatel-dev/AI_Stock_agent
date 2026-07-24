@@ -32,7 +32,9 @@ from src.llm.prompts import (
     PREMARKET_BRIEFING_PROMPT,
     SCREENER_RANK_PROMPT,
     SWING_REVIEW_PROMPT,
+    SWING_SCREENER_RANK_PROMPT,
     SWING_VETO_PROMPT,
+    SWING_WATCHLIST_RANK_PROMPT,
     TRADE_VETO_PROMPT,
     WATCHLIST_RANK_PROMPT,
 )
@@ -192,6 +194,10 @@ class OpenRouterClient:
             raise last_error
         raise RuntimeError("OpenRouter request failed")
 
+    @staticmethod
+    def _is_rate_limited(exc: BaseException) -> bool:
+        return isinstance(exc, aiohttp.ClientResponseError) and exc.status == 429
+
     async def trade_veto(self, context: dict, swing: bool = False) -> TradeVetoDecision | None:
         template = SWING_VETO_PROMPT if swing else TRADE_VETO_PROMPT
         prompt = template.format(context=json.dumps(context, indent=2))
@@ -207,10 +213,16 @@ class OpenRouterClient:
                     type(e).__name__,
                     _safe_error_message(e),
                 )
+                # Don't burn free-tier quota retrying 429 — fall through to Google.
+                if self._is_rate_limited(e):
+                    return None
         return None
 
-    async def rank_watchlist(self, context: dict) -> WatchlistRanking | None:
-        prompt = WATCHLIST_RANK_PROMPT.format(context=json.dumps(context, indent=2))
+    async def rank_watchlist(
+        self, context: dict, *, swing: bool = False
+    ) -> WatchlistRanking | None:
+        template = SWING_WATCHLIST_RANK_PROMPT if swing else WATCHLIST_RANK_PROMPT
+        prompt = template.format(context=json.dumps(context, indent=2))
         try:
             raw = await self._chat(prompt)
             parsed = OllamaClient._extract_json(raw)
@@ -252,9 +264,12 @@ class OpenRouterClient:
             trimmed.append(row)
         return {**context, "candidates": trimmed}
 
-    async def screener_rank(self, context: dict) -> ScreenerRanking | None:
+    async def screener_rank(
+        self, context: dict, *, swing: bool = False
+    ) -> ScreenerRanking | None:
         trimmed = self._trim_screener_context(context)
-        prompt = SCREENER_RANK_PROMPT.format(
+        template = SWING_SCREENER_RANK_PROMPT if swing else SCREENER_RANK_PROMPT
+        prompt = template.format(
             slots=trimmed.get("slots", 3),
             candidates=json.dumps(trimmed.get("candidates", []), indent=2),
         )
@@ -270,6 +285,8 @@ class OpenRouterClient:
                     type(e).__name__,
                     _safe_error_message(e),
                 )
+                if self._is_rate_limited(e):
+                    return None
         return None
 
     async def swing_review(self, context: dict) -> SwingReviewDecision | None:

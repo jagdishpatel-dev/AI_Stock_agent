@@ -174,6 +174,16 @@ class SymbolScalper:
                 )
                 return
 
+        ctx["outcome_cards"] = self.journal.get_outcome_cards(
+            symbol=self.symbol,
+            rsi=ctx.get("rsi"),
+            vwap_dev=ctx.get("vwap_deviation_pct"),
+            rsi_tolerance=jc.rsi_tolerance,
+            vwap_tolerance=jc.outcome_cards_vwap_tolerance,
+            lookback_days=jc.lookback_days,
+            limit=jc.outcome_cards_limit,
+        )
+
         llm_action = "approve"
         llm_confidence = 1.0
         llm_reason = "llm_disabled"

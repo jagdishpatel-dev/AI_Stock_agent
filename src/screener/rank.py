@@ -40,7 +40,10 @@ async def rank_candidates(
         return ScreenerRanking(picks=[], reasons={}, summary="no candidates")
 
     if config.llm.enabled and len(candidates) > slots:
-        ranking = await llm.screener_rank({"candidates": candidates, "slots": slots})
+        ranking = await llm.screener_rank(
+            {"candidates": candidates, "slots": slots},
+            swing=config.strategy.mode == "swing",
+        )
         if ranking and ranking.picks:
             valid = [p for p in ranking.picks if p in {c["symbol"] for c in candidates}]
             if len(valid) >= min(slots, len(candidates)):

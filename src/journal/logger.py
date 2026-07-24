@@ -330,6 +330,91 @@ class TradeJournal:
             "avg_pnl": round(sum(pnls) / total, 2) if total else 0.0,
         }
 
+    def get_outcome_cards(
+        self,
+        *,
+        symbol: str | None = None,
+        rsi: float | None = None,
+        vwap_dev: float | None = None,
+        rsi_tolerance: float = 5.0,
+        vwap_tolerance: float = 0.25,
+        lookback_days: int = 30,
+        limit: int = 5,
+    ) -> dict[str, Any]:
+        """Build short outcome cards from recent closed round-trips for LLM prompts.
+
+        Prefers similar RSI/VWAP setups, then same-symbol history, then any recent closes.
+        Example summary: ``last 5 similar: 1W/4L, avg_pnl=$-50.12``.
+        """
+        if limit <= 0:
+            return {"summary": "outcome cards disabled", "similar_count": 0, "cards": []}
+
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
+        trips = [
+            t
+            for t in self.get_round_trips(limit=300)
+            if (t.get("sell_ts") or "") >= cutoff and t.get("pnl") is not None
+        ]
+
+        def _similar(t: dict[str, Any]) -> bool:
+            if rsi is None or vwap_dev is None:
+                return False
+            tr, tv = t.get("rsi"), t.get("vwap_dev")
+            if tr is None or tv is None:
+                return False
+            return abs(float(tr) - float(rsi)) < rsi_tolerance and abs(
+                float(tv) - float(vwap_dev)
+            ) < vwap_tolerance
+
+        similar = [t for t in trips if _similar(t)]
+        same_symbol = [t for t in trips if symbol and t.get("symbol") == symbol]
+        pools = (similar, same_symbol, trips)
+
+        seen: set[str] = set()
+        selected: list[dict[str, Any]] = []
+        for pool in pools:
+            for t in pool:
+                key = str(t.get("sell_order_id") or f"{t.get('symbol')}-{t.get('sell_ts')}")
+                if key in seen:
+                    continue
+                seen.add(key)
+                selected.append(t)
+                if len(selected) >= limit:
+                    break
+            if len(selected) >= limit:
+                break
+
+        cards: list[dict[str, Any]] = []
+        for t in selected:
+            pnl = float(t["pnl"])
+            cards.append(
+                {
+                    "symbol": t.get("symbol"),
+                    "pnl": round(pnl, 2),
+                    "result": "win" if pnl > 0 else "loss",
+                    "exit_reason": t.get("exit_reason"),
+                    "entry_reason": t.get("entry_reason"),
+                    "rsi": t.get("rsi"),
+                    "vwap_dev": t.get("vwap_dev"),
+                    "volume_ratio": t.get("volume_ratio"),
+                }
+            )
+
+        wins = sum(1 for c in cards if c["result"] == "win")
+        losses = len(cards) - wins
+        avg_pnl = sum(float(c["pnl"]) for c in cards) / len(cards) if cards else 0.0
+        if cards:
+            summary = f"last {len(cards)} similar: {wins}W/{losses}L, avg_pnl=${avg_pnl:.2f}"
+        else:
+            summary = "no recent closed trades"
+
+        return {
+            "summary": summary,
+            "similar_count": len(similar),
+            "same_symbol_count": len(same_symbol),
+            "cards": cards,
+        }
+
     def save_daily_watchlist(
         self,
         date: str,

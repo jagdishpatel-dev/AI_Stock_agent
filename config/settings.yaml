@@ -58,10 +58,12 @@ risk:
 
 llm:
   enabled: true
-  primary_provider: openrouter   # auto | openrouter | google | ollama
+  # Prefer Google over free OpenRouter models (frequent 429s kill veto/rank quality).
+  # OpenRouter remains in the fallback chain when Google fails.
+  primary_provider: google   # auto | openrouter | google | ollama
   confidence_threshold: 0.7
   timeout_seconds: 90       # screener prompts + reasoning models can exceed 30s
-  watchlist_interval_minutes: 15   # 15 min safer for free-tier rate limits
+  watchlist_interval_minutes: 30   # fewer LLM calls reduces rate-limit pressure
   google_model: gemma-4-31b-it
   google_thinking_level: MINIMAL
   google_rpm_limit: 12
@@ -98,6 +100,8 @@ journal_context:
   lookback_days: 30
   min_trades_for_veto: 5
   min_win_rate: 0.4
+  outcome_cards_limit: 5
+  outcome_cards_vwap_tolerance: 0.25
 
 screener:
   enabled: true

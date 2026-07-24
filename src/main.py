@@ -319,7 +319,10 @@ class TradingAgent:
 
                 context[symbol] = entry
 
-            ranking = await self.llm.rank_watchlist(context)
+            ranking = await self.llm.rank_watchlist(
+                context,
+                swing=self.config.strategy.mode == "swing",
+            )
             if ranking:
                 logger.info("Watchlist ranking: %s — %s", ranking.ranked, ranking.reason)
                 self.journal.log_event("watchlist_rank", str(ranking.ranked))

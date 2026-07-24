@@ -17,7 +17,9 @@ from src.llm.prompts import (
     PREMARKET_BRIEFING_PROMPT,
     SCREENER_RANK_PROMPT,
     SWING_REVIEW_PROMPT,
+    SWING_SCREENER_RANK_PROMPT,
     SWING_VETO_PROMPT,
+    SWING_WATCHLIST_RANK_PROMPT,
     TRADE_VETO_PROMPT,
     WATCHLIST_RANK_PROMPT,
 )
@@ -128,8 +130,11 @@ class OllamaClient:
                 logger.warning("Ollama trade_veto attempt %d failed: %s", attempt + 1, e)
         return None
 
-    async def rank_watchlist(self, context: dict) -> WatchlistRanking | None:
-        prompt = WATCHLIST_RANK_PROMPT.format(context=json.dumps(context, indent=2))
+    async def rank_watchlist(
+        self, context: dict, *, swing: bool = False
+    ) -> WatchlistRanking | None:
+        template = SWING_WATCHLIST_RANK_PROMPT if swing else WATCHLIST_RANK_PROMPT
+        prompt = template.format(context=json.dumps(context, indent=2))
         try:
             raw = await self._chat(prompt)
             parsed = self._extract_json(raw)
@@ -152,8 +157,11 @@ class OllamaClient:
             logger.warning("Ollama premarket_briefing failed: %s", e)
             return None
 
-    async def screener_rank(self, context: dict) -> ScreenerRanking | None:
-        prompt = SCREENER_RANK_PROMPT.format(
+    async def screener_rank(
+        self, context: dict, *, swing: bool = False
+    ) -> ScreenerRanking | None:
+        template = SWING_SCREENER_RANK_PROMPT if swing else SCREENER_RANK_PROMPT
+        prompt = template.format(
             slots=context.get("slots", 3),
             candidates=json.dumps(context.get("candidates", []), indent=2),
         )

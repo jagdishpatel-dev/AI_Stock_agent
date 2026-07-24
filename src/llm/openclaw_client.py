@@ -24,6 +24,9 @@ from src.llm.prompts import (
     PREMARKET_BRIEFING_PROMPT,
     SCREENER_RANK_PROMPT,
     SWING_REVIEW_PROMPT,
+    SWING_SCREENER_RANK_PROMPT,
+    SWING_VETO_PROMPT,
+    SWING_WATCHLIST_RANK_PROMPT,
     TRADE_VETO_PROMPT,
     WATCHLIST_RANK_PROMPT,
 )
@@ -65,8 +68,9 @@ class OpenClawClient:
                 data = await resp.json()
                 return data.get("choices", [{}])[0].get("message", {}).get("content", "")
 
-    async def trade_veto(self, context: dict) -> TradeVetoDecision | None:
-        prompt = TRADE_VETO_PROMPT.format(context=json.dumps(context, indent=2))
+    async def trade_veto(self, context: dict, swing: bool = False) -> TradeVetoDecision | None:
+        template = SWING_VETO_PROMPT if swing else TRADE_VETO_PROMPT
+        prompt = template.format(context=json.dumps(context, indent=2))
         try:
             raw = await self._agent_chat(prompt)
             from src.llm.ollama_client import OllamaClient
@@ -77,8 +81,11 @@ class OpenClawClient:
             logger.warning("OpenClaw trade_veto failed: %s", e)
             return None
 
-    async def rank_watchlist(self, context: dict) -> WatchlistRanking | None:
-        prompt = WATCHLIST_RANK_PROMPT.format(context=json.dumps(context, indent=2))
+    async def rank_watchlist(
+        self, context: dict, *, swing: bool = False
+    ) -> WatchlistRanking | None:
+        template = SWING_WATCHLIST_RANK_PROMPT if swing else WATCHLIST_RANK_PROMPT
+        prompt = template.format(context=json.dumps(context, indent=2))
         try:
             raw = await self._agent_chat(prompt)
             from src.llm.ollama_client import OllamaClient
@@ -105,8 +112,11 @@ class OpenClawClient:
             logger.warning("OpenClaw premarket_briefing failed: %s", e)
             return None
 
-    async def screener_rank(self, context: dict) -> ScreenerRanking | None:
-        prompt = SCREENER_RANK_PROMPT.format(
+    async def screener_rank(
+        self, context: dict, *, swing: bool = False
+    ) -> ScreenerRanking | None:
+        template = SWING_SCREENER_RANK_PROMPT if swing else SCREENER_RANK_PROMPT
+        prompt = template.format(
             slots=context.get("slots", 3),
             candidates=json.dumps(context.get("candidates", []), indent=2),
         )

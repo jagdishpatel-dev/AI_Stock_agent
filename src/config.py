@@ -106,6 +106,8 @@ class JournalContextConfig:
     lookback_days: int = 30
     min_trades_for_veto: int = 5
     min_win_rate: float = 0.4
+    outcome_cards_limit: int = 5
+    outcome_cards_vwap_tolerance: float = 0.25
 
 
 @dataclass

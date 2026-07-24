@@ -113,16 +113,18 @@ class LLMRouter:
             "fail_safe",
         )
 
-    async def rank_watchlist(self, context: dict) -> WatchlistRanking | None:
+    async def rank_watchlist(
+        self, context: dict, *, swing: bool = False
+    ) -> WatchlistRanking | None:
         if not self.config.enabled:
             return None
         if self._ollama_healthy is None and self._primary not in _REMOTE_PRIMARIES:
             await self.check_health()
         result, _ = await self._first_result(
             {
-                "openrouter": lambda: self.openrouter.rank_watchlist(context),
-                "google": lambda: self.google.rank_watchlist(context),
-                "ollama": lambda: self.ollama.rank_watchlist(context),
+                "openrouter": lambda: self.openrouter.rank_watchlist(context, swing=swing),
+                "google": lambda: self.google.rank_watchlist(context, swing=swing),
+                "ollama": lambda: self.ollama.rank_watchlist(context, swing=swing),
             }
         )
         return result  # type: ignore[return-value]
@@ -146,14 +148,16 @@ class LLMRouter:
             reason="LLM unavailable — using keyword-only detection",
         )
 
-    async def screener_rank(self, context: dict) -> ScreenerRanking | None:
+    async def screener_rank(
+        self, context: dict, *, swing: bool = False
+    ) -> ScreenerRanking | None:
         if self._ollama_healthy is None and self._primary not in _REMOTE_PRIMARIES:
             await self.check_health()
         result, _ = await self._first_result(
             {
-                "openrouter": lambda: self.openrouter.screener_rank(context),
-                "google": lambda: self.google.screener_rank(context),
-                "ollama": lambda: self.ollama.screener_rank(context),
+                "openrouter": lambda: self.openrouter.screener_rank(context, swing=swing),
+                "google": lambda: self.google.screener_rank(context, swing=swing),
+                "ollama": lambda: self.ollama.screener_rank(context, swing=swing),
             }
         )
         return result  # type: ignore[return-value]
@@ -192,11 +196,15 @@ class LLMRouter:
         return decision, source
 
     async def swing_review(self, context: dict) -> tuple[SwingReviewDecision, str]:
-        """Fail-safe: exit if LLM unavailable."""
-        exit_default = SwingReviewDecision(action="exit", confidence=0.0, reason="llm_unavailable_fail_safe")
+        """Morning review: low-confidence exits become hold (hard stops still protect)."""
+        hold_default = SwingReviewDecision(
+            action="hold",
+            confidence=0.0,
+            reason="llm_unavailable_fail_safe_hold",
+        )
 
         if not self.config.enabled:
-            return exit_default, "none"
+            return hold_default, "none"
 
         if self._ollama_healthy is None and self._primary not in _REMOTE_PRIMARIES:
             await self.check_health()
@@ -209,19 +217,28 @@ class LLMRouter:
             }
         )
         if result is None:
-            logger.info("LLM swing_review unavailable — fail-safe exit")
-            return exit_default, "fail_safe"
+            logger.info("LLM swing_review unavailable — fail-safe hold")
+            return hold_default, "fail_safe"
 
         decision = result  # type: ignore[assignment]
         if decision.confidence < self.config.confidence_threshold:
-            return (
-                SwingReviewDecision(
-                    action="exit",
-                    confidence=decision.confidence,
-                    reason=f"low_confidence: {decision.reason}",
-                ),
-                source,
-            )
+            # Do NOT force exit on low confidence — that closed EQNR while the
+            # model reason still sounded bullish. Prefer hold; trail is skipped.
+            if decision.action in ("exit", "trail"):
+                logger.info(
+                    "LLM swing_review low confidence (%.2f < %.2f) — overriding %s -> hold",
+                    decision.confidence,
+                    self.config.confidence_threshold,
+                    decision.action,
+                )
+                return (
+                    SwingReviewDecision(
+                        action="hold",
+                        confidence=decision.confidence,
+                        reason=f"low_confidence_hold: {decision.reason}",
+                    ),
+                    source,
+                )
         return decision, source
 
     async def alert(self, title: str, message: str) -> None:

@@ -207,6 +207,17 @@ class SwingScalper:
                 )
                 return
 
+        # Outcome cards feed the veto prompt even when hard journal veto is off.
+        ctx["outcome_cards"] = self.journal.get_outcome_cards(
+            symbol=self.symbol,
+            rsi=ctx.get("rsi"),
+            vwap_dev=ctx.get("vwap_deviation_pct"),
+            rsi_tolerance=jc.rsi_tolerance,
+            vwap_tolerance=jc.outcome_cards_vwap_tolerance,
+            lookback_days=jc.lookback_days,
+            limit=jc.outcome_cards_limit,
+        )
+
         attach_daily_price_context(ctx, self.symbol, close)
 
         if self.config.llm.enabled:
@@ -296,6 +307,16 @@ class SwingScalper:
             return
 
         ctx = self._build_review_context(indicator_state, close)
+        jc = self.config.journal_context
+        ctx["outcome_cards"] = self.journal.get_outcome_cards(
+            symbol=self.symbol,
+            rsi=ctx.get("rsi"),
+            vwap_dev=ctx.get("vwap_deviation_pct"),
+            rsi_tolerance=jc.rsi_tolerance,
+            vwap_tolerance=jc.outcome_cards_vwap_tolerance,
+            lookback_days=jc.lookback_days,
+            limit=jc.outcome_cards_limit,
+        )
         decision, source = await self.llm.swing_review(ctx)
 
         self.journal.log_signal(
