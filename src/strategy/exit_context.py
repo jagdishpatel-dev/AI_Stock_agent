@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytz
 
 from src.config import AIExitConfig, AppConfig, SessionConfig
-from src.llm.ollama_client import ExitAdvisorDecision
+from src.llm.react_tools import ReactDecision
 from src.strategy.indicators import IndicatorState
 
 
@@ -97,10 +97,10 @@ def build_exit_context(
 
 
 def normalize_exit_decision(
-    decision: ExitAdvisorDecision,
+    decision: ReactDecision,
     zone: str,
     ai_exit: AIExitConfig,
-) -> ExitAdvisorDecision:
+) -> ReactDecision:
     if decision.action == "sell":
         return decision
 
@@ -115,11 +115,11 @@ def normalize_exit_decision(
         hold_mins = decision.max_hold_minutes or ai_exit.max_loss_hold_minutes
         hold_mins = max(1, min(hold_mins, ai_exit.max_loss_hold_minutes))
 
-    return ExitAdvisorDecision(
+    return ReactDecision(
         action="hold",
         target_pct=round(target, 4),
         max_hold_minutes=hold_mins,
         confidence=decision.confidence,
-        reason=decision.reason,
+        reasoning=decision.reasoning,
     )
 

@@ -8,16 +8,21 @@ from collections.abc import Awaitable, Callable
 from src.config import LLMConfig
 from src.llm.google_client import GoogleClient
 from src.llm.ollama_client import (
-    ExitAdvisorDecision,
     OllamaClient,
     PremarketBriefing,
     ScreenerRanking,
-    SwingReviewDecision,
-    TradeVetoDecision,
     WatchlistRanking,
 )
 from src.llm.openclaw_client import OpenClawClient
 from src.llm.openrouter_client import OpenRouterClient
+from src.llm.prompts import (
+    REACT_ENTRY_SYSTEM_PROMPT,
+    REACT_EXIT_ADVISOR_SYSTEM_PROMPT,
+    REACT_SWING_ENTRY_SYSTEM_PROMPT,
+    REACT_SWING_REVIEW_SYSTEM_PROMPT,
+)
+from src.llm.react_engine import run_react_loop
+from src.llm.react_tools import ALL_READ_TOOLS, ReactDecision, ToolContext, build_tool_dispatch
 
 logger = logging.getLogger(__name__)
 
@@ -76,41 +81,38 @@ class LLMRouter:
                 return result, name
         return None, "none"
 
-    async def trade_veto(self, context: dict, swing: bool = False) -> tuple[TradeVetoDecision | None, str]:
-        if not self.config.enabled:
-            return TradeVetoDecision(action="approve", confidence=1.0, reason="llm_disabled"), "none"
+    async def trade_veto_react(
+        self,
+        symbol: str,
+        signal_reason: str,
+        tool_ctx: ToolContext,
+        *,
+        swing: bool = False,
+    ) -> tuple[ReactDecision, list[dict]]:
+        """ReAct entry veto: approve (buy) or reject (hold) a rule-generated BUY signal.
 
-        if self._ollama_healthy is None and self._primary not in _REMOTE_PRIMARIES:
-            await self.check_health()
-
-        fns = {
-            "openrouter": lambda: self.openrouter.trade_veto(context, swing=swing),
-            "google": lambda: self.google.trade_veto(context, swing=swing),
-            "ollama": lambda: self.ollama.trade_veto(context, swing=swing),
-        }
-
-        best: TradeVetoDecision | None = None
-        best_source = "none"
-
-        for name, available in self._provider_chain():
-            if not available or name not in fns:
-                continue
-            decision = await fns[name]()
-            if decision is None:
-                continue
-            if decision.confidence >= self.config.confidence_threshold:
-                return decision, name
-            if best is None or decision.confidence > best.confidence:
-                best = decision
-                best_source = name
-
-        if best is not None:
-            return best, best_source
-
-        logger.info("LLM unavailable — fail-safe reject")
-        return (
-            TradeVetoDecision(action="reject", confidence=0.0, reason="llm_unavailable"),
-            "fail_safe",
+        OpenRouter only — no Google/Ollama fallback. Fails safe to "hold" (reject)
+        if OpenRouter is unconfigured, errors, or the loop exhausts its iteration cap.
+        """
+        cfg = tool_ctx.config
+        template = REACT_SWING_ENTRY_SYSTEM_PROMPT if swing else REACT_ENTRY_SYSTEM_PROMPT
+        system_prompt = template.format(
+            symbol=symbol,
+            signal_reason=signal_reason,
+            max_spread_pct=cfg.execution.max_spread_pct,
+            min_trades_for_veto=cfg.journal_context.min_trades_for_veto,
+            min_win_rate=cfg.journal_context.min_win_rate,
+            confidence_threshold=self.config.confidence_threshold,
+        )
+        return await run_react_loop(
+            self.openrouter,
+            system_prompt=system_prompt,
+            user_prompt=f"Evaluate this candidate BUY signal for {symbol} and decide.",
+            read_tools=ALL_READ_TOOLS,
+            tool_dispatch=build_tool_dispatch(tool_ctx),
+            allowed_actions={"buy", "hold"},
+            fail_safe_action="hold",
+            max_iterations=self.config.react_max_iterations,
         )
 
     async def rank_watchlist(
@@ -162,84 +164,81 @@ class LLMRouter:
         )
         return result  # type: ignore[return-value]
 
-    async def exit_advisor(self, context: dict) -> tuple[ExitAdvisorDecision, str]:
-        """Fail-safe: sell if LLM unavailable or low confidence."""
-        sell = ExitAdvisorDecision(action="sell", confidence=0.0, reason="llm_unavailable_fail_safe")
+    async def exit_advisor_react(self, zone: str, tool_ctx: ToolContext) -> tuple[ReactDecision, list[dict]]:
+        """ReAct intraday exit advisor: hold or sell an open scalp position.
 
-        if not self.config.enabled:
-            return sell, "none"
-
-        if self._ollama_healthy is None and self._primary not in _REMOTE_PRIMARIES:
-            await self.check_health()
-
-        result, source = await self._first_result(
-            {
-                "openrouter": lambda: self.openrouter.exit_advisor(context),
-                "google": lambda: self.google.exit_advisor(context),
-                "ollama": lambda: self.ollama.exit_advisor(context),
-            }
+        OpenRouter only — no Google/Ollama fallback. Fails safe to "sell" (matches
+        the original single-shot behavior) if OpenRouter is unconfigured, errors,
+        or the loop exhausts its iteration cap.
+        """
+        ai = tool_ctx.config.ai_exit
+        system_prompt = REACT_EXIT_ADVISOR_SYSTEM_PROMPT.format(
+            symbol=tool_ctx.symbol,
+            zone=zone,
+            hard_stop_pct=ai.hard_stop_loss_pct,
+            min_take_profit_pct=ai.min_take_profit_pct,
+            max_target_pct=ai.max_target_pct,
+            max_hold_minutes=ai.max_hold_minutes,
+            max_loss_hold_minutes=ai.max_loss_hold_minutes,
         )
-        if result is None:
-            logger.info("LLM exit_advisor unavailable — fail-safe sell")
-            return sell, "fail_safe"
-
-        decision = result  # type: ignore[assignment]
-        if decision.confidence < self.config.confidence_threshold:
-            return (
-                ExitAdvisorDecision(
-                    action="sell",
-                    confidence=decision.confidence,
-                    reason=f"low_confidence: {decision.reason}",
-                ),
-                source,
+        decision, trace = await run_react_loop(
+            self.openrouter,
+            system_prompt=system_prompt,
+            user_prompt=f"An open position in {tool_ctx.symbol} is in the {zone} zone. Decide whether to sell or hold.",
+            read_tools=ALL_READ_TOOLS,
+            tool_dispatch=build_tool_dispatch(tool_ctx),
+            allowed_actions={"sell", "hold"},
+            fail_safe_action="sell",
+            max_iterations=self.config.react_max_iterations,
+        )
+        if decision.confidence < self.config.confidence_threshold and decision.action == "hold":
+            decision = ReactDecision(
+                action="sell",
+                confidence=decision.confidence,
+                reasoning=f"low_confidence: {decision.reasoning}",
             )
-        return decision, source
+        return decision, trace
 
-    async def swing_review(self, context: dict) -> tuple[SwingReviewDecision, str]:
-        """Morning review: low-confidence exits become hold (hard stops still protect)."""
-        hold_default = SwingReviewDecision(
-            action="hold",
-            confidence=0.0,
-            reason="llm_unavailable_fail_safe_hold",
+    async def swing_review_react(self, tool_ctx: ToolContext) -> tuple[ReactDecision, list[dict]]:
+        """ReAct morning swing review: hold, sell (exit), or trail an open swing position.
+
+        OpenRouter only — no Google/Ollama fallback. Fails safe to "hold" (hard
+        stops still protect) if OpenRouter is unconfigured, errors, or the loop
+        exhausts its iteration cap.
+        """
+        swing = tool_ctx.config.swing
+        system_prompt = REACT_SWING_REVIEW_SYSTEM_PROMPT.format(
+            symbol=tool_ctx.symbol,
+            days_held=tool_ctx.days_held,
+            take_profit_pct=swing.take_profit_pct,
+            trail_stop_pct=swing.trailing_stop_pct,
+            hard_stop_pct=swing.hard_stop_pct,
+            max_hold_days=swing.max_hold_days,
         )
-
-        if not self.config.enabled:
-            return hold_default, "none"
-
-        if self._ollama_healthy is None and self._primary not in _REMOTE_PRIMARIES:
-            await self.check_health()
-
-        result, source = await self._first_result(
-            {
-                "openrouter": lambda: self.openrouter.swing_review(context),
-                "google": lambda: self.google.swing_review(context),
-                "ollama": lambda: self.ollama.swing_review(context),
-            }
+        decision, trace = await run_react_loop(
+            self.openrouter,
+            system_prompt=system_prompt,
+            user_prompt=f"Review the open swing position in {tool_ctx.symbol} (day {tool_ctx.days_held}) and decide.",
+            read_tools=ALL_READ_TOOLS,
+            tool_dispatch=build_tool_dispatch(tool_ctx),
+            allowed_actions={"sell", "hold", "trail"},
+            fail_safe_action="hold",
+            max_iterations=self.config.react_max_iterations,
         )
-        if result is None:
-            logger.info("LLM swing_review unavailable — fail-safe hold")
-            return hold_default, "fail_safe"
-
-        decision = result  # type: ignore[assignment]
-        if decision.confidence < self.config.confidence_threshold:
-            # Do NOT force exit on low confidence — that closed EQNR while the
-            # model reason still sounded bullish. Prefer hold; trail is skipped.
-            if decision.action in ("exit", "trail"):
-                logger.info(
-                    "LLM swing_review low confidence (%.2f < %.2f) — overriding %s -> hold",
-                    decision.confidence,
-                    self.config.confidence_threshold,
-                    decision.action,
-                )
-                return (
-                    SwingReviewDecision(
-                        action="hold",
-                        confidence=decision.confidence,
-                        reason=f"low_confidence_hold: {decision.reason}",
-                    ),
-                    source,
-                )
-        return decision, source
+        if decision.confidence < self.config.confidence_threshold and decision.action in ("sell", "trail"):
+            # Do NOT force exit on low confidence — prefer hold; trail is skipped too.
+            logger.info(
+                "swing_review_react low confidence (%.2f < %.2f) — overriding %s -> hold",
+                decision.confidence,
+                self.config.confidence_threshold,
+                decision.action,
+            )
+            decision = ReactDecision(
+                action="hold",
+                confidence=decision.confidence,
+                reasoning=f"low_confidence_hold: {decision.reasoning}",
+            )
+        return decision, trace
 
     async def alert(self, title: str, message: str) -> None:
         await self.openclaw.send_alert(title, message)

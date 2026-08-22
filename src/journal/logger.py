@@ -89,7 +89,12 @@ class TradeJournal:
 
     def _migrate_signals_columns(self, conn: sqlite3.Connection) -> None:
         existing = {row[1] for row in conn.execute("PRAGMA table_info(signals)").fetchall()}
-        for col, col_type in [("rsi", "REAL"), ("vwap_dev", "REAL"), ("volume_ratio", "REAL")]:
+        for col, col_type in [
+            ("rsi", "REAL"),
+            ("vwap_dev", "REAL"),
+            ("volume_ratio", "REAL"),
+            ("tool_trace", "TEXT"),
+        ]:
             if col not in existing:
                 conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {col_type}")
 
@@ -107,12 +112,13 @@ class TradeJournal:
         rsi: float | None = None,
         vwap_dev: float | None = None,
         volume_ratio: float | None = None,
+        tool_trace: str | None = None,
     ) -> None:
         with self._connect() as conn:
             conn.execute(
                 """INSERT INTO signals (ts, symbol, signal_type, details, llm_action, llm_confidence,
-                   llm_reason, rsi, vwap_dev, volume_ratio)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   llm_reason, rsi, vwap_dev, volume_ratio, tool_trace)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     self._now(),
                     symbol,
@@ -124,6 +130,7 @@ class TradeJournal:
                     rsi,
                     vwap_dev,
                     volume_ratio,
+                    tool_trace,
                 ),
             )
 

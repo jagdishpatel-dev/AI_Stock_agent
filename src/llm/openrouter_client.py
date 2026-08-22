@@ -19,23 +19,16 @@ import aiohttp
 
 from src.config import LLMConfig
 from src.llm.ollama_client import (
-    ExitAdvisorDecision,
     OllamaClient,
     PremarketBriefing,
     ScreenerRanking,
-    SwingReviewDecision,
-    TradeVetoDecision,
     WatchlistRanking,
 )
 from src.llm.prompts import (
-    EXIT_ADVISOR_PROMPT,
     PREMARKET_BRIEFING_PROMPT,
     SCREENER_RANK_PROMPT,
-    SWING_REVIEW_PROMPT,
     SWING_SCREENER_RANK_PROMPT,
-    SWING_VETO_PROMPT,
     SWING_WATCHLIST_RANK_PROMPT,
-    TRADE_VETO_PROMPT,
     WATCHLIST_RANK_PROMPT,
 )
 from src.logging_sanitize import sanitize_log_message
@@ -87,6 +80,22 @@ class OpenRouterClient:
             payload["models"] = [self.model, *self.fallback_models]
         return payload
 
+    def _tools_payload(self, messages: list[dict], tools: list[dict]) -> dict:
+        payload: dict = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": 0.1,
+            "stream": False,
+            "tools": tools,
+            # Force a tool call every turn: the only way a ReAct loop ends is
+            # via the submit_decision tool, never bare free-text content.
+            "tool_choice": "required",
+            "reasoning": {"enabled": self.config.openrouter_reasoning},
+        }
+        if self.fallback_models:
+            payload["models"] = [self.model, *self.fallback_models]
+        return payload
+
     @staticmethod
     def _extract_message_text(data: dict) -> str:
         """Return the assistant text, tolerating thinking-model shapes.
@@ -110,12 +119,12 @@ class OpenRouterClient:
                 return text
         return ""
 
-    async def _chat(self, prompt: str) -> str:
+    async def _post_chat(self, payload: dict) -> dict:
+        """POST to /chat/completions with retry/timeout handling; returns the parsed JSON body."""
         if not self.api_key:
             raise ValueError("OPENROUTER_API_KEY not set")
 
         url = f"{self.base_url}/chat/completions"
-        payload = self._payload(prompt)
         timeout = aiohttp.ClientTimeout(
             total=None,
             connect=15,
@@ -170,7 +179,7 @@ class OpenRouterClient:
                                 message=f"OpenRouter returned {resp.status}"
                                 + (f": {detail}" if detail else ""),
                             )
-                        data = await resp.json()
+                        return await resp.json()
             except (asyncio.TimeoutError, TimeoutError) as e:
                 last_error = e
                 if attempt < _MAX_ATTEMPTS - 1:
@@ -184,39 +193,29 @@ class OpenRouterClient:
                     await asyncio.sleep(_RETRY_DELAY_SECONDS)
                     continue
                 raise
-            else:
-                text = self._extract_message_text(data)
-                if not text:
-                    raise ValueError("OpenRouter returned empty content")
-                return text
 
         if last_error is not None:
             raise last_error
         raise RuntimeError("OpenRouter request failed")
 
+    async def _chat(self, prompt: str) -> str:
+        data = await self._post_chat(self._payload(prompt))
+        text = self._extract_message_text(data)
+        if not text:
+            raise ValueError("OpenRouter returned empty content")
+        return text
+
+    async def chat_with_tools(self, messages: list[dict], tools: list[dict]) -> dict:
+        """Send a tool-calling turn; returns the raw assistant message dict (content + tool_calls)."""
+        data = await self._post_chat(self._tools_payload(messages, tools))
+        choices = data.get("choices") or []
+        if not choices:
+            raise ValueError("OpenRouter returned no choices")
+        return choices[0].get("message") or {}
+
     @staticmethod
     def _is_rate_limited(exc: BaseException) -> bool:
         return isinstance(exc, aiohttp.ClientResponseError) and exc.status == 429
-
-    async def trade_veto(self, context: dict, swing: bool = False) -> TradeVetoDecision | None:
-        template = SWING_VETO_PROMPT if swing else TRADE_VETO_PROMPT
-        prompt = template.format(context=json.dumps(context, indent=2))
-        for attempt in range(2):
-            try:
-                raw = await self._chat(prompt)
-                parsed = OllamaClient._extract_json(raw)
-                return TradeVetoDecision.model_validate(parsed)
-            except Exception as e:
-                logger.warning(
-                    "OpenRouter trade_veto attempt %d failed: %s: %s",
-                    attempt + 1,
-                    type(e).__name__,
-                    _safe_error_message(e),
-                )
-                # Don't burn free-tier quota retrying 429 — fall through to Google.
-                if self._is_rate_limited(e):
-                    return None
-        return None
 
     async def rank_watchlist(
         self, context: dict, *, swing: bool = False
@@ -288,48 +287,3 @@ class OpenRouterClient:
                 if self._is_rate_limited(e):
                     return None
         return None
-
-    async def swing_review(self, context: dict) -> SwingReviewDecision | None:
-        swing = context.get("_swing_limits", {})
-        prompt = SWING_REVIEW_PROMPT.format(
-            days_held=context.get("days_held", 0),
-            context=json.dumps({k: v for k, v in context.items() if not k.startswith("_")}, indent=2),
-            take_profit_pct=swing.get("take_profit_pct", 2.5),
-            trail_stop_pct=swing.get("trailing_stop_pct", 0.5),
-            hard_stop_pct=swing.get("hard_stop_pct", 1.5),
-            max_hold_days=swing.get("max_hold_days", 5),
-        )
-        try:
-            raw = await self._chat(prompt)
-            parsed = OllamaClient._extract_json(raw)
-            return SwingReviewDecision.model_validate(parsed)
-        except Exception as e:
-            logger.warning(
-                "OpenRouter swing_review failed: %s: %s",
-                type(e).__name__,
-                _safe_error_message(e),
-            )
-            return None
-
-    async def exit_advisor(self, context: dict) -> ExitAdvisorDecision | None:
-        ai_exit = context.get("_ai_exit_limits", {})
-        prompt = EXIT_ADVISOR_PROMPT.format(
-            zone=context.get("zone", "profit"),
-            hard_stop_pct=ai_exit.get("hard_stop_loss_pct", 0.12),
-            context=json.dumps({k: v for k, v in context.items() if not k.startswith("_")}, indent=2),
-            min_take_profit_pct=ai_exit.get("min_take_profit_pct", 0.20),
-            max_target_pct=ai_exit.get("max_target_pct", 1.0),
-            max_hold_minutes=ai_exit.get("max_hold_minutes", 20),
-            max_loss_hold_minutes=ai_exit.get("max_loss_hold_minutes", 8),
-        )
-        try:
-            raw = await self._chat(prompt)
-            parsed = OllamaClient._extract_json(raw)
-            return ExitAdvisorDecision.model_validate(parsed)
-        except Exception as e:
-            logger.warning(
-                "OpenRouter exit_advisor failed: %s: %s",
-                type(e).__name__,
-                _safe_error_message(e),
-            )
-            return None
