@@ -43,7 +43,23 @@ else
 fi
 
 echo "==> Service status"
-systemctl is-active "trading-dashboard@${USER_NAME}.service"
-systemctl is-active "trading-agent@${USER_NAME}.service"
+# systemctl restart returns immediately; the service can sit in "activating"
+# for a moment before systemd reports "active", which was failing this check
+# (and the whole deploy) on services that were actually starting up fine.
+wait_for_active() {
+  local svc="$1"
+  for _ in $(seq 1 10); do
+    if systemctl is-active --quiet "$svc"; then
+      echo "$svc: active"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "$svc: $(systemctl is-active "$svc" || true)"
+  return 1
+}
+
+wait_for_active "trading-dashboard@${USER_NAME}.service"
+wait_for_active "trading-agent@${USER_NAME}.service"
 
 echo "==> Deploy complete"
