@@ -238,7 +238,7 @@ def load_config(path: Path | None = None) -> AppConfig:
 
     llm = LLMConfig(
         enabled=llm_raw.get("enabled", True),
-        primary_provider=llm_raw.get("primary_provider", os.getenv("LLM_PRIMARY_PROVIDER", "auto")),
+        primary_provider=os.getenv("LLM_PRIMARY_PROVIDER", llm_raw.get("primary_provider", "auto")),
         confidence_threshold=llm_raw.get("confidence_threshold", 0.7),
         timeout_seconds=llm_raw.get("timeout_seconds", 3.0),
         watchlist_interval_minutes=llm_raw.get("watchlist_interval_minutes", 10),

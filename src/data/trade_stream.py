@@ -43,7 +43,10 @@ class OrderUpdateStream:
             "status": str(order.status),
         }
         if event.lower() in ("fill", "partial_fill"):
-            await self.on_update("fill", data)
+            # Forward the real event name — collapsing both to "fill" defeated
+            # the `if event != "fill"` guard downstream, so every partial fill
+            # tick (cumulative filled_qty) was journaled as its own trade.
+            await self.on_update(event.lower(), data)
         logger.debug("Order update: %s %s", event, data)
 
     async def run(self) -> None:

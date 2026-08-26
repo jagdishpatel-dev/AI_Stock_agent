@@ -223,17 +223,21 @@ class OpenRouterClient:
     ) -> WatchlistRanking | None:
         template = SWING_WATCHLIST_RANK_PROMPT if swing else WATCHLIST_RANK_PROMPT
         prompt = template.format(context=json.dumps(context, indent=2))
-        try:
-            raw = await self._chat(prompt)
-            parsed = OllamaClient._extract_json(raw)
-            return WatchlistRanking.model_validate(parsed)
-        except Exception as e:
-            logger.warning(
-                "OpenRouter rank_watchlist failed: %s: %s",
-                type(e).__name__,
-                _safe_error_message(e),
-            )
-            return None
+        for attempt in range(2):
+            try:
+                raw = await self._chat(prompt)
+                parsed = OllamaClient._extract_json(raw)
+                return WatchlistRanking.model_validate(parsed)
+            except Exception as e:
+                logger.warning(
+                    "OpenRouter rank_watchlist attempt %d failed: %s: %s",
+                    attempt + 1,
+                    type(e).__name__,
+                    _safe_error_message(e),
+                )
+                if self._is_rate_limited(e):
+                    return None
+        return None
 
     async def premarket_briefing(self, context: dict) -> PremarketBriefing | None:
         prompt = PREMARKET_BRIEFING_PROMPT.format(
@@ -241,17 +245,21 @@ class OpenRouterClient:
             news=json.dumps(context.get("news", []), indent=2),
             keyword_flags=json.dumps(context.get("keyword_flags", {}), indent=2),
         )
-        try:
-            raw = await self._chat(prompt)
-            parsed = OllamaClient._extract_json(raw)
-            return PremarketBriefing.model_validate(parsed)
-        except Exception as e:
-            logger.warning(
-                "OpenRouter premarket_briefing failed: %s: %s",
-                type(e).__name__,
-                _safe_error_message(e),
-            )
-            return None
+        for attempt in range(2):
+            try:
+                raw = await self._chat(prompt)
+                parsed = OllamaClient._extract_json(raw)
+                return PremarketBriefing.model_validate(parsed)
+            except Exception as e:
+                logger.warning(
+                    "OpenRouter premarket_briefing attempt %d failed: %s: %s",
+                    attempt + 1,
+                    type(e).__name__,
+                    _safe_error_message(e),
+                )
+                if self._is_rate_limited(e):
+                    return None
+        return None
 
     @staticmethod
     def _trim_screener_context(context: dict) -> dict:

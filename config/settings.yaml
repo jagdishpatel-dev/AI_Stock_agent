@@ -58,9 +58,12 @@ risk:
 
 llm:
   enabled: true
-  # Prefer Google over free OpenRouter models (frequent 429s kill veto/rank quality).
-  # OpenRouter remains in the fallback chain when Google fails.
-  primary_provider: google   # auto | openrouter | google | ollama
+  # OpenRouter is primary (env var LLM_PRIMARY_PROVIDER overrides this).
+  # Previously set to "google" because free OpenRouter models returned empty
+  # content under load; fixed by switching to a non-reasoning instruct model
+  # and adding a retry, so OpenRouter is back to primary. Google remains in
+  # the fallback chain.
+  primary_provider: openrouter   # auto | openrouter | google | ollama
   confidence_threshold: 0.7
   timeout_seconds: 90       # screener prompts + reasoning models can exceed 30s
   watchlist_interval_minutes: 30   # fewer LLM calls reduces rate-limit pressure
@@ -68,7 +71,11 @@ llm:
   google_thinking_level: MINIMAL
   google_rpm_limit: 12
   # OpenRouter (env vars OPENROUTER_* take precedence over these)
-  openrouter_model: nvidia/nemotron-3-ultra-550b-a55b:free
+  # Plain instruct model, not a reasoning model: Nemotron-3-Ultra with reasoning
+  # disabled was returning empty `content` (and empty `reasoning`) under load,
+  # which read as "OpenRouter returned empty content" in every rank_watchlist
+  # cycle. An instruct model always writes to `content`, so it can't fail that way.
+  openrouter_model: meta-llama/llama-3.3-70b-instruct:free
   openrouter_reasoning: false        # false = fast clean JSON; true = deeper reasoning
   openrouter_fallback_models: []     # e.g. ["arcee-ai/trinity-large-preview:free"]
 
