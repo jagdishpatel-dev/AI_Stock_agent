@@ -71,13 +71,18 @@ llm:
   google_thinking_level: MINIMAL
   google_rpm_limit: 12
   # OpenRouter (env vars OPENROUTER_* take precedence over these)
-  # Plain instruct model, not a reasoning model: Nemotron-3-Ultra with reasoning
-  # disabled was returning empty `content` (and empty `reasoning`) under load,
-  # which read as "OpenRouter returned empty content" in every rank_watchlist
-  # cycle. An instruct model always writes to `content`, so it can't fail that way.
-  openrouter_model: meta-llama/llama-3.3-70b-instruct:free
+  # Verified against the live API 2026-09-07 (3/3 successful parses, 1.5-4.0s).
+  # Do NOT use nemotron-3-ultra-550b-a55b:free here: it returns HTTP 200 with
+  # null content, null reasoning AND null finish_reason after ~37s (the upstream
+  # provider drops the generation), which surfaces as "OpenRouter returned empty
+  # content" on every call. Check a model is actually still free before switching
+  # — llama-3.3-70b-instruct:free and nemotron-3-nano-30b-a3b:free are now 404
+  # ("unavailable for free, use the paid slug").
+  openrouter_model: nvidia/nemotron-3-super-120b-a12b:free
   openrouter_reasoning: false        # false = fast clean JSON; true = deeper reasoning
-  openrouter_fallback_models: []     # e.g. ["arcee-ai/trinity-large-preview:free"]
+  # openrouter/free is OpenRouter's auto-router over free models — server-side
+  # failover if the primary errors or is rate-limited (still one request).
+  openrouter_fallback_models: ["openrouter/free"]
 
 execution:
   max_spread_pct: 0.03
