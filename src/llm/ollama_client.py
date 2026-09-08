@@ -70,12 +70,19 @@ class OllamaClient:
         self.config = config
         self.base_url = config.ollama_host.rstrip("/")
         self.model = config.ollama_model
+        self.api_key = config.ollama_api_key
+
+    def _headers(self) -> dict[str, str]:
+        # Local Ollama needs no auth; Ollama Cloud (https://ollama.com) requires
+        # a Bearer token from an OLLAMA_API_KEY (see https://docs.ollama.com/cloud).
+        return {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
 
     async def health_check(self) -> bool:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     f"{self.base_url}/api/tags",
+                    headers=self._headers(),
                     timeout=aiohttp.ClientTimeout(total=2),
                 ) as resp:
                     return resp.status == 200
@@ -97,6 +104,7 @@ class OllamaClient:
             async with session.post(
                 f"{self.base_url}/api/chat",
                 json=payload,
+                headers=self._headers(),
                 timeout=timeout,
             ) as resp:
                 resp.raise_for_status()

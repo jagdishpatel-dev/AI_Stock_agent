@@ -148,6 +148,7 @@ class LLMConfig:
     google_rpm_limit: int = 12
     ollama_host: str = "http://127.0.0.1:11434"
     ollama_model: str = "phi4-mini"
+    ollama_api_key: str = ""
     openrouter_api_key: str = ""
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_model: str = ""
@@ -251,6 +252,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         google_rpm_limit=int(llm_raw.get("google_rpm_limit", os.getenv("GOOGLE_RPM_LIMIT", "12"))),
         ollama_host=os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434"),
         ollama_model=os.getenv("OLLAMA_MODEL", "phi4-mini"),
+        ollama_api_key=os.getenv("OLLAMA_API_KEY", ""),
         openrouter_api_key=os.getenv("OPENROUTER_API_KEY", ""),
         openrouter_base_url=os.getenv(
             "OPENROUTER_BASE_URL",
