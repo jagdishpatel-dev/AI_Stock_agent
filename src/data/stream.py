@@ -20,6 +20,8 @@ OnQuoteHandler = Callable[[Quote], Awaitable[None]]
 
 
 class MarketDataStream:
+    RECONNECT_MAX_DELAY_SECONDS = 60
+
     def __init__(
         self,
         config: AppConfig,
@@ -42,6 +44,42 @@ class MarketDataStream:
         # uses run_coroutine_threadsafe(...).result() and deadlocks on this event loop.
         for symbol in self.symbols:
             self._register_handlers(symbol)
+        self._install_reconnect_backoff()
+
+    def _install_reconnect_backoff(self) -> None:
+        """Add exponential backoff to the SDK's connect retries.
+
+        alpaca-py's ``_run_forever`` catches a failed ``_start_ws`` and loops with
+        ``finally: await asyncio.sleep(0)`` — no delay at all. Auth failures raise
+        ValueError, and only "insufficient subscription" exits the loop, so anything
+        else (notably "connection limit exceeded", which the free IEX feed returns
+        when another connection still holds the single allowed slot) becomes a hot
+        loop retrying several times a second, forever. That never gives Alpaca time
+        to release the old slot, so a transient condition turns into a permanent
+        outage that also floods the log. Sleeping before the exception propagates
+        turns that hot loop into a backed-off one.
+        """
+        original = self._stream._start_ws
+        failures = 0
+
+        async def _start_ws_with_backoff() -> None:
+            nonlocal failures
+            try:
+                await original()
+            except Exception as e:
+                failures += 1
+                delay = min(2**failures, self.RECONNECT_MAX_DELAY_SECONDS)
+                logger.warning(
+                    "Data stream connect failed (attempt %d): %s — retrying in %ds",
+                    failures,
+                    e,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                raise
+            failures = 0
+
+        self._stream._start_ws = _start_ws_with_backoff
 
     def get_quote(self, symbol: str) -> Quote | None:
         return self._latest_quotes.get(symbol)
