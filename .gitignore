@@ -11,3 +11,4 @@ node_modules/
 frontend/dist/
 scripts/pdf-deps/node_modules/
 docs/.SYSTEM_REPORT_pdf_temp.*
+.agents/

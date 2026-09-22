@@ -16,6 +16,8 @@ OnOrderUpdate = Callable[[str, dict], Awaitable[None]]
 
 
 class OrderUpdateStream:
+    RECONNECT_MAX_DELAY_SECONDS = 60
+
     def __init__(self, config: AppConfig, on_update: OnOrderUpdate) -> None:
         self.config = config
         self.on_update = on_update
@@ -25,6 +27,41 @@ class OrderUpdateStream:
             paper="paper" in config.alpaca_base_url,
         )
         self._stream.subscribe_trade_updates(self._handle_update)
+        self._install_reconnect_backoff()
+
+    def _install_reconnect_backoff(self) -> None:
+        """Add exponential backoff to the SDK's connect retries.
+
+        Same hot loop as MarketDataStream, and the same fix. alpaca-py's trading
+        ``_run_forever`` catches a failed ``_start_ws`` and loops with
+        ``finally: await asyncio.sleep(0.01)``, so any connect failure that isn't
+        a clean shutdown retries ~100 times a second forever. A brief DNS outage
+        on the host produced 23 reconnect attempts in 0.8s, each with a full
+        traceback — order fills flow through this stream, so it floods the log
+        and burns CPU at exactly the wrong moment. Sleeping before the exception
+        propagates turns that hot loop into a backed-off one.
+        """
+        original = self._stream._start_ws
+        failures = 0
+
+        async def _start_ws_with_backoff() -> None:
+            nonlocal failures
+            try:
+                await original()
+            except Exception as e:
+                failures += 1
+                delay = min(2**failures, self.RECONNECT_MAX_DELAY_SECONDS)
+                logger.warning(
+                    "Trading stream connect failed (attempt %d): %s — retrying in %ds",
+                    failures,
+                    e,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                raise
+            failures = 0
+
+        self._stream._start_ws = _start_ws_with_backoff
 
     async def _handle_update(self, update: object) -> None:
         event = str(getattr(update, "event", ""))
