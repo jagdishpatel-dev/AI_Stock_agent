@@ -142,6 +142,7 @@ class LLMConfig:
     confidence_threshold: float = 0.7
     timeout_seconds: float = 3.0
     watchlist_interval_minutes: int = 10
+    react_max_iterations: int = 5
     google_api_key: str = ""
     google_model: str = "gemma-4-31b-it"
     google_thinking_level: str = "MINIMAL"
@@ -243,6 +244,7 @@ def load_config(path: Path | None = None) -> AppConfig:
         confidence_threshold=llm_raw.get("confidence_threshold", 0.7),
         timeout_seconds=llm_raw.get("timeout_seconds", 3.0),
         watchlist_interval_minutes=llm_raw.get("watchlist_interval_minutes", 10),
+        react_max_iterations=int(llm_raw.get("react_max_iterations", os.getenv("REACT_MAX_ITERATIONS", "5"))),
         google_api_key=os.getenv("GOOGLE_API_KEY", ""),
         google_model=os.getenv("GOOGLE_MODEL", llm_raw.get("google_model", "gemma-4-31b-it")),
         google_thinking_level=os.getenv(

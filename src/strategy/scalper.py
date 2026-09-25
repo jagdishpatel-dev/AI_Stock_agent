@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -11,6 +12,7 @@ from src.config import AppConfig
 from src.data.stream import MarketDataStream
 from src.execution.orders import OrderExecutor
 from src.journal.logger import TradeJournal, TradeRecord
+from src.llm.react_tools import ToolContext
 from src.llm.router import LLMRouter
 from src.risk.manager import RiskManager
 from src.risk.sizing import calculate_position_size
@@ -81,6 +83,21 @@ class SymbolScalper:
             "vwap_dev": context.get("vwap_deviation_pct"),
             "volume_ratio": context.get("volume_ratio"),
         }
+
+    def _tool_context(self, indicator_state: IndicatorState) -> ToolContext:
+        in_position = self.state == ScalpState.IN_POSITION
+        return ToolContext(
+            symbol=self.symbol,
+            config=self.config,
+            indicator_state=indicator_state,
+            stream=self.stream,
+            positions=self.risk.positions,
+            journal=self.journal,
+            entry_price=self.entry_price if in_position else None,
+            entry_time=self.entry_time if in_position else None,
+            highest_since_entry=self.highest_since_entry if in_position else None,
+            position_qty=self.position_qty if in_position else None,
+        )
 
     def _pnl_pct(self, price: float) -> float:
         if self.entry_price <= 0:
@@ -174,27 +191,19 @@ class SymbolScalper:
                 )
                 return
 
-        ctx["outcome_cards"] = self.journal.get_outcome_cards(
-            symbol=self.symbol,
-            rsi=ctx.get("rsi"),
-            vwap_dev=ctx.get("vwap_deviation_pct"),
-            rsi_tolerance=jc.rsi_tolerance,
-            vwap_tolerance=jc.outcome_cards_vwap_tolerance,
-            lookback_days=jc.lookback_days,
-            limit=jc.outcome_cards_limit,
-        )
-
         llm_action = "approve"
         llm_confidence = 1.0
         llm_reason = "llm_disabled"
+        trace: list[dict] = []
 
         if self.config.llm.enabled:
-            decision, source = await self.llm.trade_veto(ctx)
-            llm_action = decision.action
+            tool_ctx = self._tool_context(indicator_state)
+            decision, trace = await self.llm.trade_veto_react(self.symbol, entry_signal.reason, tool_ctx)
+            llm_action = "approve" if decision.action == "buy" else "reject"
             llm_confidence = decision.confidence
-            llm_reason = f"[{source}] {decision.reason}"
+            llm_reason = f"[react] {decision.reasoning}"
 
-            if decision.action == "reject":
+            if decision.action != "buy":
                 self.journal.log_signal(
                     self.symbol,
                     "entry_vetoed",
@@ -202,6 +211,7 @@ class SymbolScalper:
                     llm_action,
                     llm_confidence,
                     llm_reason,
+                    tool_trace=json.dumps(trace),
                     **self._indicator_kwargs(ctx),
                 )
                 logger.info("%s LLM vetoed entry: %s", self.symbol, llm_reason)
@@ -214,6 +224,7 @@ class SymbolScalper:
             llm_action,
             llm_confidence,
             llm_reason,
+            tool_trace=json.dumps(trace) if trace else None,
             **self._indicator_kwargs(ctx),
         )
         await self._submit_buy(close)
@@ -287,7 +298,8 @@ class SymbolScalper:
             self.config,
             zone,
         )
-        decision, source = await self.llm.exit_advisor(ctx)
+        tool_ctx = self._tool_context(indicator_state)
+        decision, trace = await self.llm.exit_advisor_react(zone, tool_ctx)
         decision = normalize_exit_decision(decision, zone, self.config.ai_exit)
 
         if zone == "profit":
@@ -302,10 +314,11 @@ class SymbolScalper:
             zone,
             decision.action,
             decision.confidence,
-            f"[{source}] target={decision.target_pct}% hold={decision.max_hold_minutes}m — {decision.reason}",
+            f"[react] target={decision.target_pct}% hold={decision.max_hold_minutes}m — {decision.reasoning}",
             rsi=ctx.get("rsi"),
             vwap_dev=ctx.get("vwap_deviation_pct"),
             volume_ratio=ctx.get("volume_ratio"),
+            tool_trace=json.dumps(trace),
         )
 
         if decision.action == "sell":
@@ -319,8 +332,8 @@ class SymbolScalper:
             zone=zone,
             target_pct=decision.target_pct or 0.0,
             deadline=datetime.now(timezone.utc) + timedelta(minutes=hold_mins),
-            source=source,
-            reason=decision.reason,
+            source="react",
+            reason=decision.reasoning,
         )
         logger.info(
             "%s AI hold (%s): target=%.2f%% deadline=%dm — %s",
@@ -328,7 +341,7 @@ class SymbolScalper:
             zone,
             self.active_plan.target_pct,
             hold_mins,
-            decision.reason,
+            decision.reasoning,
         )
         return False
 

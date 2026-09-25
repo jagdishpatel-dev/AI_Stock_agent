@@ -3,66 +3,23 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
-
-from alpaca.data.historical.news import NewsClient
-from alpaca.data.requests import NewsRequest
 
 from src.config import AppConfig
-from src.data.news_parse import article_to_headline_fields, extract_news_articles
+from src.data.news_parse import fetch_recent_news, keyword_flags
 from src.llm.ollama_client import PremarketBriefing
 from src.llm.router import LLMRouter
 
 logger = logging.getLogger(__name__)
 
-RISK_KEYWORDS = ("earnings", "fda", "guidance", "downgrade", "lawsuit", "sec ", "investigation")
-
-
-def _fetch_news(config: AppConfig, symbols: list[str]) -> list[dict]:
-    client = NewsClient(
-        api_key=config.alpaca_api_key,
-        secret_key=config.alpaca_secret_key,
-    )
-    start = datetime.now(timezone.utc) - timedelta(hours=config.briefing.news_lookback_hours)
-    request = NewsRequest(
-        symbols=",".join(symbols),
-        start=start,
-        limit=config.briefing.news_limit,
-        include_content=False,
-    )
-    try:
-        result = client.get_news(request)
-    except Exception:
-        logger.exception("Failed to fetch pre-market news")
-        return []
-
-    items: list[dict] = []
-    for article in extract_news_articles(result):
-        items.append(article_to_headline_fields(article))
-    return items
-
-
-def _keyword_flags(news: list[dict], symbols: list[str]) -> dict[str, list[str]]:
-    flags: dict[str, list[str]] = {s: [] for s in symbols}
-    for article in news:
-        headline = (article.get("headline") or "").lower()
-        matched = [kw for kw in RISK_KEYWORDS if kw in headline]
-        if not matched:
-            continue
-        for sym in article.get("symbols", []):
-            if sym in flags:
-                flags[sym].extend(matched)
-    return {sym: list(set(hits)) for sym, hits in flags.items() if hits}
-
 
 async def run_briefing(config: AppConfig, llm: LLMRouter, symbols: list[str] | None = None) -> PremarketBriefing:
     watchlist = symbols or config.symbols
-    news = _fetch_news(config, watchlist)
-    keyword_flags = _keyword_flags(news, watchlist)
+    news = fetch_recent_news(config, watchlist)
+    flags = keyword_flags(news, watchlist)
     context = {
         "symbols": watchlist,
         "news": news,
-        "keyword_flags": keyword_flags,
+        "keyword_flags": flags,
     }
 
     if not config.briefing.enabled:
@@ -70,7 +27,7 @@ async def run_briefing(config: AppConfig, llm: LLMRouter, symbols: list[str] | N
 
     if not news:
         logger.warning("No news available for pre-market briefing")
-        keyword_avoid = list(keyword_flags.keys())
+        keyword_avoid = list(flags.keys())
         return PremarketBriefing(
             avoid=keyword_avoid,
             caution=[],

@@ -11,6 +11,7 @@ Key differences from SymbolScalper:
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -20,10 +21,10 @@ from src.config import AppConfig
 from src.data.stream import MarketDataStream
 from src.execution.orders import OrderExecutor
 from src.journal.logger import TradeJournal, TradeRecord
+from src.llm.react_tools import ToolContext
 from src.llm.router import LLMRouter
 from src.risk.manager import RiskManager
 from src.risk.sizing import calculate_position_size
-from src.strategy.entry_context import attach_daily_price_context
 from src.strategy.indicators import IndicatorState
 from src.strategy.swing_signals import SignalType, evaluate_swing_entry, evaluate_swing_exit
 
@@ -88,6 +89,23 @@ class SwingScalper:
         if self.entry_time is None:
             return 0.0
         return (datetime.now(timezone.utc) - self.entry_time).total_seconds() / 3600
+
+    def _tool_context(self, indicator_state: IndicatorState) -> ToolContext:
+        in_position = self.state == SwingState.IN_POSITION
+        return ToolContext(
+            symbol=self.symbol,
+            config=self.config,
+            indicator_state=indicator_state,
+            stream=self.stream,
+            positions=self.risk.positions,
+            journal=self.journal,
+            swing=True,
+            entry_price=self.entry_price if in_position else None,
+            entry_time=self.entry_time if in_position else None,
+            highest_since_entry=self.highest_since_entry if in_position else None,
+            position_qty=self.position_qty if in_position else None,
+            days_held=self._days_held() if in_position else None,
+        )
 
     def _build_review_context(self, indicator_state: IndicatorState, close: float) -> dict:
         rsi = indicator_state.rsi(14)
@@ -207,26 +225,18 @@ class SwingScalper:
                 )
                 return
 
-        # Outcome cards feed the veto prompt even when hard journal veto is off.
-        ctx["outcome_cards"] = self.journal.get_outcome_cards(
-            symbol=self.symbol,
-            rsi=ctx.get("rsi"),
-            vwap_dev=ctx.get("vwap_deviation_pct"),
-            rsi_tolerance=jc.rsi_tolerance,
-            vwap_tolerance=jc.outcome_cards_vwap_tolerance,
-            lookback_days=jc.lookback_days,
-            limit=jc.outcome_cards_limit,
-        )
-
-        attach_daily_price_context(ctx, self.symbol, close)
+        trace: list[dict] = []
 
         if self.config.llm.enabled:
-            decision, source = await self.llm.trade_veto(ctx, swing=True)
-            llm_action = decision.action
+            tool_ctx = self._tool_context(indicator_state)
+            decision, trace = await self.llm.trade_veto_react(
+                self.symbol, entry_signal.reason, tool_ctx, swing=True
+            )
+            llm_action = "approve" if decision.action == "buy" else "reject"
             llm_confidence = decision.confidence
-            llm_reason = f"[{source}] {decision.reason}"
+            llm_reason = f"[react] {decision.reasoning}"
 
-            if decision.action == "reject":
+            if decision.action != "buy":
                 self.journal.log_signal(
                     self.symbol,
                     "entry_vetoed",
@@ -234,6 +244,7 @@ class SwingScalper:
                     llm_action,
                     llm_confidence,
                     llm_reason,
+                    tool_trace=json.dumps(trace),
                 )
                 logger.info("%s LLM vetoed swing entry: %s", self.symbol, llm_reason)
                 return
@@ -248,6 +259,7 @@ class SwingScalper:
             rsi=ctx.get("rsi"),
             vwap_dev=ctx.get("vwap_deviation_pct"),
             volume_ratio=ctx.get("volume_ratio"),
+            tool_trace=json.dumps(trace) if trace else None,
         )
         await self._submit_buy(close)
 
@@ -307,17 +319,8 @@ class SwingScalper:
             return
 
         ctx = self._build_review_context(indicator_state, close)
-        jc = self.config.journal_context
-        ctx["outcome_cards"] = self.journal.get_outcome_cards(
-            symbol=self.symbol,
-            rsi=ctx.get("rsi"),
-            vwap_dev=ctx.get("vwap_deviation_pct"),
-            rsi_tolerance=jc.rsi_tolerance,
-            vwap_tolerance=jc.outcome_cards_vwap_tolerance,
-            lookback_days=jc.lookback_days,
-            limit=jc.outcome_cards_limit,
-        )
-        decision, source = await self.llm.swing_review(ctx)
+        tool_ctx = self._tool_context(indicator_state)
+        decision, trace = await self.llm.swing_review_react(tool_ctx)
 
         self.journal.log_signal(
             self.symbol,
@@ -325,23 +328,23 @@ class SwingScalper:
             f"morning_review day={self._days_held()}",
             decision.action,
             decision.confidence,
-            f"[{source}] stop_pct={decision.new_stop_pct} — {decision.reason}",
+            f"[react] stop_pct={decision.new_stop_pct} — {decision.reasoning}",
             rsi=ctx.get("rsi"),
             vwap_dev=ctx.get("vwap_deviation_pct"),
             volume_ratio=ctx.get("volume_ratio"),
+            tool_trace=json.dumps(trace),
         )
 
         logger.info(
-            "%s morning review [%s]: action=%s confidence=%.2f stop=%s — %s",
+            "%s morning review [react]: action=%s confidence=%.2f stop=%s — %s",
             self.symbol,
-            source,
             decision.action,
             decision.confidence,
             decision.new_stop_pct,
-            decision.reason,
+            decision.reasoning,
         )
 
-        if decision.action == "exit":
+        if decision.action == "sell":
             await self._exit(close, "ai_swing_exit_morning", market=True)
         elif decision.action == "trail" and decision.new_stop_pct is not None:
             new_stop = max(0.1, min(decision.new_stop_pct, self.swing.stop_loss_pct))
