@@ -66,7 +66,19 @@ llm:
   primary_provider: openrouter   # auto | openrouter | google | ollama
   confidence_threshold: 0.7
   timeout_seconds: 90       # screener prompts + reasoning models can exceed 30s
-  watchlist_interval_minutes: 30   # fewer LLM calls reduces rate-limit pressure
+  watchlist_interval_minutes: 30   # oneshot mode only; fewer LLM calls reduces rate-limit pressure
+  # Watchlist ranking: oneshot (single prompt on the interval above) or react
+  # (model investigates symbols with read-only tools, then ranks). ReAct runs
+  # react_runs_per_day times, evenly spaced from session open + offset to close.
+  # Each run is <= react_max_steps tool calls + 1 final answer (<= 25 LLM calls/day).
+  watchlist_mode: react
+  react_runs_per_day: 5
+  react_first_run_offset_minutes: 15
+  react_max_steps: 4
+  # Gate: bottom N ranked symbols can't open NEW entries until the next ranking.
+  # Held positions are never gated (exits are unaffected either way).
+  watchlist_gate_enabled: true
+  watchlist_gate_bottom_n: 3
   google_model: gemma-4-31b-it
   google_thinking_level: MINIMAL
   google_rpm_limit: 12
