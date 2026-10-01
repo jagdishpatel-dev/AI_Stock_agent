@@ -6,7 +6,7 @@ An automated US equities trading agent with a real-time dashboard — paper trad
 
 This project is a full-stack trading system built to explore algorithmic trading with a safety-first design: fast Python rules handle every 1-minute bar, while large language models only review, rank, or veto decisions. Trades execute against an Alpaca paper account, so you can run strategies on live market data without risking real capital.
 
-The agent runs a daily pipeline — morning screener, pre-market briefing, live bar streaming, signal generation, risk checks, and bracket order execution — and logs everything to SQLite. A React dashboard (served by FastAPI on port 8000) shows portfolio overview, trades, signals, screener results, events, logs, and an admin panel for runtime settings.
+The agent runs a daily pipeline — morning screener, pre-market briefing, live bar streaming, signal generation, a [ReAct watchlist ranking](#react-watchlist-ranking) that gates weak symbols, risk checks, and bracket order execution — and logs everything to SQLite. A React dashboard (served by FastAPI on port 8000) shows portfolio overview, trades, signals, screener results, events, logs, and an admin panel for runtime settings.
 
 It supports two strategy modes configured in `config/settings.yaml`: **scalper** (intraday, ~0.20% targets during the first two hours) and **swing** (multi-day holds with 2–3% targets and overnight positions). LLM providers are pluggable: OpenRouter, Google AI Studio, local Ollama, or OpenClaw for alerts.
 
@@ -23,7 +23,7 @@ It supports two strategy modes configured in `config/settings.yaml`: **scalper**
 ### Installation
 
 ```bash
-git clone https://github.com/OneandOnly-Jagdish-Patel/AI_Stock_agent.git
+git clone https://github.com/jagdishpatel-dev/AI_Stock_agent.git
 cd AI_Stock_agent
 
 python3 -m venv .venv
@@ -100,6 +100,77 @@ python scripts/screener_report.py   # Daily screener output
 python scripts/backtest.py          # Historical backtest
 ```
 
+## ReAct Watchlist Ranking
+
+Five times per market day, an LLM agent re-ranks the watchlist using the **ReAct** (Reason + Act) pattern: it reasons about the metrics table, calls read-only tools to investigate the symbols it's unsure about, and returns a ranking. The lowest-ranked symbols are blocked from **new** entries until the next ranking.
+
+```mermaid
+flowchart LR
+    S[Metrics table<br/>RSI · VWAP dev · close] --> T{Thought}
+    T -->|tool call| A[Read-only tool]
+    A -->|observation| T
+    T -->|final| R[Ranked watchlist]
+    R --> G[Gate bottom 3<br/>until next run]
+    R --> J[(Journal events)]
+    T -. loop fails .-> F[One-shot ranking fallback]
+    F --> R
+```
+
+### Schedule
+
+Runs are spaced evenly from session open + 15 min to the close. With the default session (8:30–15:00 CST):
+
+| Run | 1 | 2 | 3 | 4 | 5 |
+|-----|---|---|---|---|---|
+| Time (CST) | 08:45 | 10:00 | 11:15 | 12:30 | 13:45 |
+
+Each run is capped at 4 tool calls + 1 final answer, so the agent uses at most **25 LLM calls per day**. If the agent starts late, missed runs are skipped rather than replayed.
+
+### Tools
+
+The model can only read. It has no tool that places orders, sizes positions, or changes settings.
+
+| Tool | Returns |
+|------|---------|
+| `get_intraday` | Live RSI, VWAP deviation, EMAs, ATR, volume ratio, recent closes |
+| `get_daily` | Recent daily closes (multi-day trend) |
+| `get_news` | Latest news headlines for the symbol |
+| `get_position` | Whether it's already held, and its P&L |
+| `get_risk_state` | Kill switch, today's P&L, pre-market avoid list |
+
+### Entry gate
+
+- The bottom `watchlist_gate_bottom_n` ranked symbols can't open new positions until the next ranking.
+- **Held positions are never gated**, and exits, stops, and trailing logic are unaffected.
+- Symbols the model leaves out of its ranking are not gated.
+- The gate resets every day, and clears if neither ReAct nor the one-shot fallback produces a ranking.
+
+### What gets logged
+
+Every run is visible on the dashboard's **Events** page:
+
+| Event | Contents |
+|-------|----------|
+| `watchlist_react_step` | Each thought, tool call, and observation |
+| `watchlist_rank` | Run number, source (`react` or `oneshot_fallback`), ranking, reason |
+| `watchlist_gate` | Which symbols were gated (and which were exempt because they're held) |
+
+Blocked entries also appear on the **Signals** page as `entry_vetoed` with reason `watchlist_rank_gate`.
+
+### Configuration
+
+```yaml
+llm:
+  watchlist_mode: react             # react | oneshot (single prompt every watchlist_interval_minutes)
+  react_runs_per_day: 5
+  react_first_run_offset_minutes: 15
+  react_max_steps: 4                # tool calls per run, plus 1 final answer
+  watchlist_gate_enabled: true
+  watchlist_gate_bottom_n: 3
+```
+
+Set `watchlist_mode: oneshot` to go back to the previous single-prompt ranking. The implementation lives in [`src/llm/react.py`](src/llm/react.py).
+
 ## Tech Stack
 
 | Layer | Technologies |
@@ -125,7 +196,7 @@ AI_Stock_agent/
 │   ├── briefing/           # Pre-market briefing pipeline
 │   ├── execution/          # Order placement and position tracking
 │   ├── risk/               # Kill switch, position limits, PDT rules
-│   ├── llm/                # Multi-provider LLM router and prompts
+│   ├── llm/                # Multi-provider LLM router, prompts, ReAct agent
 │   ├── data/               # Market streams, bars, Yahoo client
 │   └── journal/            # SQLite trade journal
 ├── frontend/               # React dashboard (Overview, Trades, Signals, …)
@@ -161,7 +232,7 @@ Primary configuration lives in `config/settings.yaml`:
 - **`strategy.mode`** — `scalper` or `swing`
 - **`swing.*`** — Take-profit, stop-loss, hold duration, entry filters
 - **`risk.*`** — Max positions, daily loss limit, PDT safeguards
-- **`llm.*`** — Provider selection, model names, timeouts
+- **`llm.*`** — Provider selection, model names, timeouts, [ReAct watchlist ranking](#react-watchlist-ranking) and entry gate
 - **`session.*`** — Trading window and timezone
 
 Environment variables in `.env` override LLM and broker credentials. Runtime settings can also be changed via the Admin page in the dashboard without restarting the agent.
@@ -179,6 +250,9 @@ Deploy the latest `main` branch to a VM with:
 bash scripts/deploy.sh
 ```
 
-A GitHub Actions workflow (`.github/workflows/check-status.yml`) can trigger `scripts/check_status.sh` on a self-hosted runner to verify service health.
+Two GitHub Actions workflows run on a self-hosted runner:
+
+- `.github/workflows/deploy.yml` — **runs `scripts/deploy.sh` automatically on every push to `main`**, so merging a PR deploys it to the VM and restarts the agent. Prefer merging outside market hours.
+- `.github/workflows/check-status.yml` — runs `scripts/check_status.sh` to verify service health.
 
 For a deep dive into architecture, daily timelines, signal logic, and module breakdown, see [docs/SYSTEM_REPORT.md](docs/SYSTEM_REPORT.md).
