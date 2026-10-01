@@ -50,6 +50,7 @@ class SwingScalper:
         llm: LLMRouter,
         stream: MarketDataStream,
         avoided_symbols: set[str] | None = None,
+        rank_gated: set[str] | None = None,
     ) -> None:
         self.symbol = symbol
         self.config = config
@@ -61,6 +62,8 @@ class SwingScalper:
         self.stream = stream
         self.avoided_symbols = avoided_symbols or set()
         self._avoid_block_logged = False
+        self.rank_gated = rank_gated if rank_gated is not None else set()
+        self._gate_block_logged = False
 
         self.state = SwingState.IDLE
         self.entry_price: float = 0.0
@@ -151,6 +154,21 @@ class SwingScalper:
                     self.symbol,
                 )
             return
+
+        if self.symbol in self.rank_gated:
+            if not self._gate_block_logged:
+                self._gate_block_logged = True
+                self.journal.log_signal(
+                    self.symbol,
+                    "entry_vetoed",
+                    "watchlist_rank_gate",
+                    "reject",
+                    1.0,
+                    "Symbol in bottom of latest LLM watchlist ranking",
+                )
+                logger.info("%s entry blocked — bottom of latest watchlist ranking", self.symbol)
+            return
+        self._gate_block_logged = False
 
         entry_signal = evaluate_swing_entry(
             self.symbol,

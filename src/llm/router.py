@@ -129,6 +129,38 @@ class LLMRouter:
         )
         return result  # type: ignore[return-value]
 
+    async def complete_json(self, prompt: str) -> dict | None:
+        """One free-form prompt -> parsed JSON object, with provider fallback (used by ReAct)."""
+        if self._ollama_healthy is None and self._primary not in _REMOTE_PRIMARIES:
+            await self.check_health()
+
+        def _parsed(chat: Callable[[str], Awaitable[str]], name: str) -> Callable[[], Awaitable[dict | None]]:
+            async def call() -> dict | None:
+                for attempt in range(2):
+                    try:
+                        parsed = OllamaClient._extract_json(await chat(prompt))
+                    except Exception as e:
+                        logger.warning(
+                            "%s complete_json attempt %d failed: %s", name, attempt + 1, type(e).__name__
+                        )
+                        if OpenRouterClient._is_rate_limited(e):
+                            return None
+                        continue
+                    if isinstance(parsed, dict):
+                        return parsed
+                return None
+
+            return call
+
+        result, _ = await self._first_result(
+            {
+                "openrouter": _parsed(self.openrouter._chat, "OpenRouter"),
+                "google": _parsed(self.google._generate, "Google"),
+                "ollama": _parsed(self.ollama._chat, "Ollama"),
+            }
+        )
+        return result  # type: ignore[return-value]
+
     async def briefing_decision(self, context: dict) -> PremarketBriefing:
         if self._ollama_healthy is None and self._primary not in _REMOTE_PRIMARIES:
             await self.check_health()

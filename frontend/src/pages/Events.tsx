@@ -9,6 +9,8 @@ const EVENT_TYPES = [
   "",
   "premarket_briefing",
   "watchlist_rank",
+  "watchlist_react_step",
+  "watchlist_gate",
   "kill_switch",
 ];
 

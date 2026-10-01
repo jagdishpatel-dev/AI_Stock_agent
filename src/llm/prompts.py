@@ -80,6 +80,42 @@ Rules:
 Respond exactly:
 {{"ranked": ["SYMBOL1", "SYMBOL2", ...], "reason": "brief reason"}}"""
 
+REACT_WATCHLIST_RULES_SCALP = """- Goal: intraday scalping priority
+- Prefer strong short-term momentum (price above VWAP, positive change_pct, rising volume)
+- Deprioritize names with risky fresh news or that already sit on the pre-market avoid list"""
+
+REACT_WATCHLIST_RULES_SWING = """- Goal: multi-day SWING / momentum priority (holds of 1-5 days), NOT intraday scalping
+- Prefer liquid names with sustained upward momentum across several days
+- Prefer moderate gaps and healthy volume over extreme one-day spikes that often fade
+- Deprioritize exhaustion / gap-and-crap candidates and names with risky fresh news"""
+
+REACT_WATCHLIST_PROMPT = """You rank a stock watchlist by trading priority. Work step by step: think, optionally call a
+read-only tool to investigate a symbol, read the observation, and repeat. Then give the final ranking.
+The lowest-ranked symbols will be blocked from new entries until the next ranking, so rank carefully.
+
+Rules:
+{rules}
+- If data_quality is "partial", use research_price / research_change_pct; null live metrics alone are not a reason to rank last
+- Investigate symbols where the table is ambiguous; don't waste calls on obvious cases
+- Rank EVERY symbol in the table, best first
+
+Tools:
+{tools}
+
+Watchlist metrics:
+{seed}
+
+Steps so far:
+{transcript}
+
+{budget}
+
+Respond with ONE JSON object only — no markdown, no prose. Keep "thought" to one short sentence.
+Either a tool call:
+{{"thought": "why", "action": "<tool name>", "args": {{"symbol": "XYZ"}}}}
+or the final answer:
+{{"thought": "why", "action": "final", "args": {{"ranked": ["SYMBOL1", "SYMBOL2", ...], "reason": "brief reason"}}}}"""
+
 ALERT_SUMMARY_PROMPT = """Summarize this trading session for the user in 2-3 sentences:
 {context}"""
 

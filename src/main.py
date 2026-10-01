@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -14,9 +15,9 @@ import pytz
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.briefing.premarket import run_briefing
+from src.briefing.premarket import _fetch_news, run_briefing
 from src.config import AppConfig, load_config
-from src.data.yahoo_client import fetch_finnhub_quote, fetch_quote_snapshot
+from src.data.yahoo_client import fetch_finnhub_quote, fetch_quote_snapshot, fetch_recent_daily_closes
 from src.logging_sanitize import SensitiveDataFilter
 from src.data.bars import BarManager
 from src.data.stream import MarketDataStream
@@ -25,6 +26,13 @@ from src.execution.hydration import held_symbols, hydrate_swing_positions
 from src.execution.orders import OrderExecutor
 from src.execution.positions import PositionManager
 from src.journal.logger import TradeJournal
+from src.llm.react import (
+    WatchlistReactAgent,
+    build_watchlist_tools,
+    compute_gate,
+    due_run_index,
+    react_run_times,
+)
 from src.llm.router import LLMRouter
 from src.risk.manager import RiskManager
 from src.screener.daily import build_daily_watchlist
@@ -63,6 +71,11 @@ class TradingAgent:
         self.active_symbols: list[str] = list(config.symbols)
         self.avoided_symbols: set[str] = set()
         self._avoid_list_date: str | None = None
+        # Bottom-ranked symbols blocked from new entries until the next ranking.
+        # Mutated in place so every scalper's reference stays live.
+        self.rank_gated: set[str] = set()
+        self._react_date: str | None = None
+        self._react_runs_done: set[int] = set()
         self._stream: MarketDataStream | None = None
         self._trade_stream: OrderUpdateStream | None = None
         self._running = False
@@ -206,11 +219,13 @@ class TradingAgent:
                 self.llm,
                 self._stream,
                 avoided_symbols=self.avoided_symbols,
+                rank_gated=self.rank_gated,
             )
 
         # Refresh the avoid list reference on every live scalper.
         for scalper in self.scalpers.values():
             scalper.avoided_symbols = self.avoided_symbols
+            scalper.rank_gated = self.rank_gated
 
         if added:
             await self._stream.subscribe(added)
@@ -274,58 +289,153 @@ class TradingAgent:
             await scalper.on_bar(state)
 
     async def _watchlist_loop(self) -> None:
+        if self.config.llm.watchlist_mode == "react":
+            await self._react_watchlist_loop()
+            return
+
         interval = self.config.llm.watchlist_interval_minutes * 60
         while self._running:
             await asyncio.sleep(interval)
             if not self._in_trading_session() or not self.config.llm.enabled:
                 continue
 
-            symbols = list(self.bar_manager.states.keys())
-            yahoo_snapshots: dict = {}
-            if self.config.research.provider == "yahoo" and self.config.research.yahoo_enabled:
-                try:
-                    yahoo_snapshots = fetch_quote_snapshot(symbols)
-                except Exception:
-                    logger.warning("Yahoo watchlist snapshot failed", exc_info=True)
-
-            context: dict = {}
-            for symbol, state in self.bar_manager.states.items():
-                rsi = state.rsi(self.config.strategy.rsi_period)
-                vwap_dev = state.vwap_deviation_pct()
-                close = state.latest_close()
-                entry: dict = {
-                    "rsi": rsi,
-                    "vwap_dev": vwap_dev,
-                    "close": close,
-                }
-
-                live_missing = rsi is None or vwap_dev is None or close is None
-                snap = yahoo_snapshots.get(symbol)
-                if live_missing and snap:
-                    entry["research_price"] = snap.price
-                    entry["research_change_pct"] = snap.change_pct
-                    entry["research_volume"] = snap.volume
-                    entry["metrics_source"] = snap.metrics_source
-                    entry["data_quality"] = "partial"
-                elif live_missing and self.config.research.finnhub_fallback and self.config.finnhub_api_key:
-                    fh = fetch_finnhub_quote(symbol, self.config.finnhub_api_key)
-                    if fh:
-                        entry["research_price"] = fh.price
-                        entry["research_change_pct"] = fh.change_pct
-                        entry["metrics_source"] = fh.metrics_source
-                        entry["data_quality"] = "partial"
-                else:
-                    entry["data_quality"] = "live"
-
-                context[symbol] = entry
-
-            ranking = await self.llm.rank_watchlist(
-                context,
-                swing=self.config.strategy.mode == "swing",
-            )
+            context = self._build_watchlist_context()
+            ranking = await self.llm.rank_watchlist(context, swing=self._is_swing)
             if ranking:
                 logger.info("Watchlist ranking: %s — %s", ranking.ranked, ranking.reason)
                 self.journal.log_event("watchlist_rank", str(ranking.ranked))
+                await self._apply_rank_gate(ranking.ranked)
+
+    async def _react_watchlist_loop(self) -> None:
+        """Run ReAct ranking react_runs_per_day times, evenly spaced across the session."""
+        tz = pytz.timezone(self.config.session.timezone)
+        llm_cfg = self.config.llm
+        end_time = self.config.swing.session_end_time if self._is_swing else self.config.session.end_time
+
+        while self._running:
+            await asyncio.sleep(30)
+            now = datetime.now(tz)
+            today = now.date().isoformat()
+            if today != self._react_date:
+                self._react_date = today
+                self._react_runs_done.clear()
+                self.rank_gated.clear()  # yesterday's gate never carries over
+
+            if not self._in_trading_session() or not llm_cfg.enabled:
+                continue
+
+            times = react_run_times(
+                now,
+                self.config.session.start_time,
+                end_time,
+                llm_cfg.react_runs_per_day,
+                llm_cfg.react_first_run_offset_minutes,
+            )
+            idx = due_run_index(now, times, self._react_runs_done)
+            if idx is None:
+                continue
+            # Mark every slot up to this one done so missed slots are skipped, not replayed.
+            self._react_runs_done.update(range(idx + 1))
+
+            try:
+                await self._run_react_ranking(idx + 1, len(times))
+            except Exception:
+                logger.exception("ReAct watchlist ranking failed")
+
+    async def _run_react_ranking(self, run_no: int, total_runs: int) -> None:
+        context = self._build_watchlist_context()
+        if not context:
+            return
+
+        tools = build_watchlist_tools(
+            bar_manager=self.bar_manager,
+            positions=self.positions,
+            risk=self.risk,
+            avoided_symbols=self.avoided_symbols,
+            rsi_period=self.config.strategy.rsi_period,
+            fetch_news=lambda syms: _fetch_news(self.config, syms),
+            fetch_daily=fetch_recent_daily_closes,
+        )
+        agent = WatchlistReactAgent(
+            self.llm.complete_json,
+            tools,
+            max_steps=self.config.llm.react_max_steps,
+            swing=self._is_swing,
+        )
+        result = await agent.run(context)
+
+        label = f"run {run_no}/{total_runs}"
+        if result is not None:
+            for i, step in enumerate(result.steps, 1):
+                self.journal.log_event("watchlist_react_step", f"{label} step {i}: {json.dumps(step, default=str)}")
+            ranked, reason, source = result.ranked, result.reason, "react"
+        else:
+            ranking = await self.llm.rank_watchlist(context, swing=self._is_swing)
+            if ranking is None:
+                logger.warning("ReAct %s: no ranking from ReAct or one-shot fallback — gate cleared", label)
+                self.rank_gated.clear()
+                self.journal.log_event("watchlist_gate", f"{label}: no ranking available, gate cleared")
+                return
+            ranked, reason, source = ranking.ranked, ranking.reason, "oneshot_fallback"
+
+        logger.info("Watchlist ranking (%s, %s): %s — %s", label, source, ranked, reason)
+        self.journal.log_event("watchlist_rank", f"{label} [{source}] {ranked} — {reason}")
+        await self._apply_rank_gate(ranked, label=label)
+
+    async def _apply_rank_gate(self, ranked: list[str], label: str = "") -> None:
+        if not self.config.llm.watchlist_gate_enabled:
+            return
+        candidates = compute_gate(ranked, self.config.llm.watchlist_gate_bottom_n)
+        held = {s for s in candidates if await asyncio.to_thread(self._symbol_has_exposure, s)}
+        gated = candidates - held
+        self.rank_gated.clear()
+        self.rank_gated.update(gated)
+        msg = f"{label + ': ' if label else ''}gated {sorted(gated) or 'none'}"
+        if held:
+            msg += f" (held, not gated: {sorted(held)})"
+        logger.info("Watchlist gate — %s", msg)
+        self.journal.log_event("watchlist_gate", msg)
+
+    def _build_watchlist_context(self) -> dict:
+        symbols = list(self.bar_manager.states.keys())
+        yahoo_snapshots: dict = {}
+        if self.config.research.provider == "yahoo" and self.config.research.yahoo_enabled:
+            try:
+                yahoo_snapshots = fetch_quote_snapshot(symbols)
+            except Exception:
+                logger.warning("Yahoo watchlist snapshot failed", exc_info=True)
+
+        context: dict = {}
+        for symbol, state in self.bar_manager.states.items():
+            rsi = state.rsi(self.config.strategy.rsi_period)
+            vwap_dev = state.vwap_deviation_pct()
+            close = state.latest_close()
+            entry: dict = {
+                "rsi": rsi,
+                "vwap_dev": vwap_dev,
+                "close": close,
+            }
+
+            live_missing = rsi is None or vwap_dev is None or close is None
+            snap = yahoo_snapshots.get(symbol)
+            if live_missing and snap:
+                entry["research_price"] = snap.price
+                entry["research_change_pct"] = snap.change_pct
+                entry["research_volume"] = snap.volume
+                entry["metrics_source"] = snap.metrics_source
+                entry["data_quality"] = "partial"
+            elif live_missing and self.config.research.finnhub_fallback and self.config.finnhub_api_key:
+                fh = fetch_finnhub_quote(symbol, self.config.finnhub_api_key)
+                if fh:
+                    entry["research_price"] = fh.price
+                    entry["research_change_pct"] = fh.change_pct
+                    entry["metrics_source"] = fh.metrics_source
+                    entry["data_quality"] = "partial"
+            else:
+                entry["data_quality"] = "live"
+
+            context[symbol] = entry
+        return context
 
     async def _on_order_update(self, event: str, order_data: dict) -> None:
         symbol = order_data.get("symbol", "")
@@ -518,6 +628,7 @@ class TradingAgent:
                 self.llm,
                 self._stream,
                 avoided_symbols=self.avoided_symbols,
+                rank_gated=self.rank_gated,
             )
 
         if self._is_swing:
