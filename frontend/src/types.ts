@@ -12,6 +12,10 @@ export interface Stats {
   win_count: number;
   loss_count: number;
   win_rate: number;
+  flat_count: number;
+  avg_win: number | null;
+  avg_loss: number | null;
+  profit_factor: number | null;
   total_pnl: number;
   entry_signals: number;
   llm_vetoes: number;
@@ -24,6 +28,10 @@ export interface LifetimeStats {
   win_count: number;
   loss_count: number;
   win_rate: number;
+  flat_count: number;
+  avg_win: number | null;
+  avg_loss: number | null;
+  profit_factor: number | null;
 }
 
 export interface AccountSnapshot {
