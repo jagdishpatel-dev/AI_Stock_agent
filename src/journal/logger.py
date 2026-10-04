@@ -10,6 +10,24 @@ from pathlib import Path
 from typing import Any
 
 
+def _outcome_stats(pnls: list[float]) -> dict[str, Any]:
+    """Win/loss breakdown for closed trades. Break-even trades count as flat, not losses."""
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    gross_win = sum(wins)
+    gross_loss = -sum(losses)
+    return {
+        "trade_count": len(pnls),
+        "win_count": len(wins),
+        "loss_count": len(losses),
+        "flat_count": len(pnls) - len(wins) - len(losses),
+        "win_rate": round(len(wins) / len(pnls), 3) if pnls else 0.0,
+        "avg_win": round(gross_win / len(wins), 2) if wins else None,
+        "avg_loss": round(gross_loss / len(losses), 2) if losses else None,
+        "profit_factor": round(gross_win / gross_loss, 2) if gross_loss else None,
+    }
+
+
 @dataclass
 class TradeRecord:
     symbol: str
@@ -230,14 +248,7 @@ class TradeJournal:
                 "SELECT pnl FROM trades WHERE side = 'sell' AND pnl IS NOT NULL"
             ).fetchall()
         pnls = [float(r["pnl"]) for r in rows]
-        wins = sum(1 for p in pnls if p > 0)
-        return {
-            "total_pnl": round(sum(pnls), 2),
-            "trade_count": len(pnls),
-            "win_count": wins,
-            "loss_count": len(pnls) - wins,
-            "win_rate": round(wins / len(pnls), 3) if pnls else 0.0,
-        }
+        return {"total_pnl": round(sum(pnls), 2), **_outcome_stats(pnls)}
 
     def get_last_trade_date(self) -> str | None:
         with self._connect() as conn:
@@ -612,17 +623,13 @@ class TradeJournal:
     def get_stats(self, date: str | None = None) -> dict[str, Any]:
         trades = self.list_trades(date=date, limit=1000)
         sells = [t for t in trades if t["side"] == "sell" and t.get("pnl") is not None]
-        wins = sum(1 for t in sells if t["pnl"] > 0)
-        total_pnl = sum(t["pnl"] for t in sells)
+        pnls = [float(t["pnl"]) for t in sells]
         signals = self.list_signals(date=date, limit=1000)
         vetoes = [s for s in signals if s["signal_type"] == "entry_vetoed"]
         entries = [s for s in signals if s["signal_type"] == "entry"]
         return {
-            "trade_count": len(sells),
-            "win_count": wins,
-            "loss_count": len(sells) - wins,
-            "win_rate": round(wins / len(sells), 3) if sells else 0.0,
-            "total_pnl": round(total_pnl, 2),
+            **_outcome_stats(pnls),
+            "total_pnl": round(sum(pnls), 2),
             "entry_signals": len(entries),
             "llm_vetoes": len(vetoes),
             "exit_signals": sum(1 for s in signals if s["signal_type"] == "exit"),

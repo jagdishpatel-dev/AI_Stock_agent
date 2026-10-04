@@ -220,7 +220,7 @@ export function OverviewPage() {
           className={(dayPnl ?? 0) >= 0 ? "positive" : "negative"}
           sub={
             hasDayActivity
-              ? `${stats?.win_count ?? 0}W / ${stats?.loss_count ?? 0}L`
+              ? `${stats?.win_count ?? 0}W / ${stats?.loss_count ?? 0}L${stats?.flat_count ? ` / ${stats.flat_count} flat` : ""}`
               : "No activity"
           }
         />
@@ -233,17 +233,26 @@ export function OverviewPage() {
         />
         <StatCard
           variant="compact"
-          label="Win Rate"
+          label="Trade Quality"
           value={
-            (lifetime?.trade_count ?? 0) > 0
-              ? fmtPct(lifetime?.win_rate)
-              : hasDayActivity
-                ? fmtPct(stats?.win_rate)
+            lifetime?.profit_factor != null
+              ? `${lifetime.profit_factor.toFixed(2)}× PF`
+              : (lifetime?.trade_count ?? 0) > 0
+                ? fmtPct(lifetime?.win_rate)
                 : "—"
           }
           sub={
             (lifetime?.trade_count ?? 0) > 0
-              ? `${lifetime?.win_count ?? 0}W / ${lifetime?.loss_count ?? 0}L`
+              ? [
+                  lifetime?.avg_win != null && lifetime?.avg_loss != null
+                    ? `Avg win ${fmtMoney(lifetime.avg_win)} / loss ${fmtMoney(lifetime.avg_loss)}`
+                    : null,
+                  `${fmtPct(lifetime?.win_rate)} win rate · ${lifetime?.win_count ?? 0}W / ${lifetime?.loss_count ?? 0}L${
+                    lifetime?.flat_count ? ` / ${lifetime.flat_count} flat` : ""
+                  }`,
+                ]
+                  .filter(Boolean)
+                  .join(" · ")
               : "No closed trades"
           }
         />
