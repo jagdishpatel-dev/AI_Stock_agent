@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import logging
 import os
+import secrets
+import time
 from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import pytz
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -29,20 +33,60 @@ from src.settings_store import (
 
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="AI Trading Agent Dashboard", version="1.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["*"],
+# No interactive docs or OpenAPI schema in production, and no CORS middleware:
+# the dashboard is served from the same origin, so other sites can't call the API.
+app = FastAPI(
+    title="AI Trading Agent Dashboard",
+    version="1.0.0",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
 )
 
 _config = load_config()
 _journal = TradeJournal(_config.journal_db_path)
 _log_path = PROJECT_ROOT / "logs" / "agent.log"
 _admin_key = os.getenv("ADMIN_API_KEY", "")
+
+# Dashboard session: the frontend fetches /api/session to get a signed, HttpOnly
+# cookie, and every other /api/* call requires it (or a valid X-Admin-Key).
+# Without DASHBOARD_SESSION_SECRET a random secret is used per process; sessions
+# then reset on restart and the frontend transparently fetches a new one.
+_SESSION_COOKIE = "dash_session"
+_SESSION_TTL_SECONDS = 12 * 60 * 60
+_SESSION_EXEMPT_PATHS = {"/api/session", "/api/health"}
+_session_secret = (os.getenv("DASHBOARD_SESSION_SECRET") or secrets.token_hex(32)).encode()
+
+
+def _sign_session(expires: int) -> str:
+    sig = hmac.new(_session_secret, str(expires).encode(), hashlib.sha256).hexdigest()
+    return f"{expires}.{sig}"
+
+
+def _valid_session(token: str | None) -> bool:
+    if not token:
+        return False
+    expires, _, sig = token.partition(".")
+    if not expires.isdigit() or int(expires) < time.time():
+        return False
+    return hmac.compare_digest(sig, _sign_session(int(expires)).partition(".")[2])
+
+
+def _valid_admin_key(key: str | None) -> bool:
+    return bool(_admin_key) and key is not None and hmac.compare_digest(key, _admin_key)
+
+
+@app.middleware("http")
+async def _require_dashboard_session(request: Request, call_next):
+    path = request.url.path
+    if (
+        path.startswith("/api/")
+        and path not in _SESSION_EXEMPT_PATHS
+        and not _valid_session(request.cookies.get(_SESSION_COOKIE))
+        and not _valid_admin_key(request.headers.get("X-Admin-Key"))
+    ):
+        return JSONResponse({"detail": "Dashboard session required"}, status_code=401)
+    return await call_next(request)
 
 
 def _reload_runtime_config() -> None:
@@ -57,7 +101,7 @@ def _require_admin(x_admin_key: str | None = Header(default=None, alias="X-Admin
             status_code=503,
             detail="Admin API disabled — set ADMIN_API_KEY in .env on the server",
         )
-    if not x_admin_key or x_admin_key != _admin_key:
+    if not _valid_admin_key(x_admin_key):
         raise HTTPException(status_code=401, detail="Invalid or missing admin key")
 
 
@@ -219,6 +263,22 @@ def health() -> dict[str, str]:
     return {"status": "ok", "today": _today_et(), "market_status": _market_status()}
 
 
+@app.get("/api/session")
+def session(request: Request, response: Response) -> dict[str, Any]:
+    expires = int(time.time()) + _SESSION_TTL_SECONDS
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    response.set_cookie(
+        _SESSION_COOKIE,
+        _sign_session(expires),
+        max_age=_SESSION_TTL_SECONDS,
+        path="/api",
+        httponly=True,
+        samesite="strict",
+        secure=proto == "https",
+    )
+    return {"ok": True, "expires": expires}
+
+
 @app.get("/api/account")
 def account() -> dict[str, Any]:
     data = _fetch_account()
@@ -342,6 +402,7 @@ def events(
     event_type: str | None = None,
     limit: int = Query(200, le=500),
     offset: int = 0,
+    _: None = Depends(_require_admin),
 ) -> list[dict[str, Any]]:
     return _journal.list_events(
         date=date,
@@ -368,12 +429,15 @@ def watchlist_dates(limit: int = 30) -> list[str]:
 
 
 @app.get("/api/config")
-def config() -> dict[str, Any]:
+def config(_: None = Depends(_require_admin)) -> dict[str, Any]:
     return _sanitize_config()
 
 
 @app.get("/api/logs")
-def logs(lines: int = Query(200, le=1000)) -> dict[str, Any]:
+def logs(
+    lines: int = Query(200, le=1000),
+    _: None = Depends(_require_admin),
+) -> dict[str, Any]:
     if not _log_path.exists():
         return {"path": str(_log_path), "lines": [], "exists": False}
     with open(_log_path) as f:
