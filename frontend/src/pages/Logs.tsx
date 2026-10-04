@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import { api } from "../api/client";
+import { api, getAdminKey } from "../api/client";
+import { AdminRequired } from "../components/AdminRequired";
 import { LoadingButton } from "../components/LoadingButton";
 
 function logClass(line: string) {
@@ -13,8 +14,10 @@ export function LogsPage() {
   const [exists, setExists] = useState(true);
   const [error, setError] = useState("");
   const [autoRefresh, setAutoRefresh] = useState(true);
+  const hasAdminKey = !!getAdminKey();
 
   const load = useCallback(async () => {
+    if (!hasAdminKey) return;
     try {
       const data = await api.logs(400);
       setLines(data.lines);
@@ -23,17 +26,28 @@ export function LogsPage() {
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load logs");
     }
-  }, []);
+  }, [hasAdminKey]);
 
   useEffect(() => {
     load();
   }, [load]);
 
   useEffect(() => {
-    if (!autoRefresh) return;
+    if (!autoRefresh || !hasAdminKey) return;
     const id = setInterval(load, 5000);
     return () => clearInterval(id);
-  }, [autoRefresh, load]);
+  }, [autoRefresh, hasAdminKey, load]);
+
+  if (!hasAdminKey) {
+    return (
+      <>
+        <div className="page-header">
+          <h2>Agent Logs</h2>
+        </div>
+        <AdminRequired what="Agent logs" />
+      </>
+    );
+  }
 
   return (
     <>

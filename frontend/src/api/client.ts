@@ -11,8 +11,31 @@ import type {
   WatchlistEntry,
 } from "../types";
 
+// The API requires a signed session cookie issued by /api/session. Fetch it once,
+// and again if a request comes back 401 (cookie expired or server restarted).
+let sessionPromise: Promise<void> | null = null;
+
+function ensureSession(refresh = false): Promise<void> {
+  if (refresh || !sessionPromise) {
+    sessionPromise = fetch("/api/session")
+      .then((res) => {
+        if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      })
+      .catch((e) => {
+        sessionPromise = null;
+        throw e;
+      });
+  }
+  return sessionPromise;
+}
+
 async function get<T>(path: string): Promise<T> {
-  const res = await fetch(path);
+  await ensureSession();
+  let res = await fetch(path);
+  if (res.status === 401) {
+    await ensureSession(true);
+    res = await fetch(path);
+  }
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json() as Promise<T>;
 }
@@ -78,7 +101,7 @@ export const api = {
     if (params?.date) q.set("date", params.date);
     if (params?.event_type) q.set("event_type", params.event_type);
     const qs = q.toString();
-    return get<Event[]>(`/api/events${qs ? `?${qs}` : ""}`);
+    return adminFetch<Event[]>(`/api/events${qs ? `?${qs}` : ""}`);
   },
   dailyPnl: () => get<DailySummary[]>("/api/daily-pnl"),
   watchlist: (date?: string) =>
@@ -87,8 +110,8 @@ export const api = {
     ),
   watchlistDates: () => get<string[]>("/api/watchlist/dates"),
   logs: (lines = 200) =>
-    get<{ lines: string[]; exists: boolean }>(`/api/logs?lines=${lines}`),
-  config: () => get<Record<string, unknown>>("/api/config"),
+    adminFetch<{ lines: string[]; exists: boolean }>(`/api/logs?lines=${lines}`),
+  config: () => adminFetch<Record<string, unknown>>("/api/config"),
   lastTradeDate: async () => {
     const o = await get<Overview>("/api/overview");
     return o.last_trade_date;

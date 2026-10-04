@@ -54,7 +54,8 @@ Copy `.env.example` to `.env` and configure:
 | `OPENROUTER_API_KEY` | Primary LLM provider (when using OpenRouter) |
 | `GOOGLE_API_KEY` | Google AI Studio (alternative LLM provider) |
 | `OLLAMA_HOST` / `OLLAMA_MODEL` | Local Ollama fallback |
-| `ADMIN_API_KEY` | Required for admin API writes (`/api/admin/*`) |
+| `ADMIN_API_KEY` | Required for `/api/admin/*`, `/api/logs`, `/api/config` and `/api/events` |
+| `DASHBOARD_SESSION_SECRET` | Optional — signs dashboard session cookies (random per restart if unset) |
 | `FINNHUB_API_KEY` | Optional — earnings data for the daily screener |
 
 See `.env.example` for the full list and defaults.
@@ -212,17 +213,32 @@ The dashboard backend exposes these key endpoints (all under `http://localhost:8
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /api/health` | Health check |
+| `GET /api/health` | Health check (public) |
+| `GET /api/session` | Issues the dashboard session cookie (public) |
 | `GET /api/overview` | Portfolio summary, P&L, positions |
 | `GET /api/trades` | Trade history |
 | `GET /api/signals` | Recent entry/exit signals |
 | `GET /api/watchlist` | Daily screener watchlist |
 | `GET /api/daily-pnl` | Daily profit and loss |
-| `GET /api/logs` | Agent log tail |
-| `GET /api/admin/settings` | Runtime settings (read) |
-| `PUT /api/admin/settings` | Update settings (requires `ADMIN_API_KEY`) |
+| `GET /api/logs` | Agent log tail (admin key) |
+| `GET /api/events` | Agent events and briefings (admin key) |
+| `GET /api/config` | Sanitized runtime config (admin key) |
+| `GET /api/admin/settings` | Runtime settings (admin key) |
+| `PUT /api/admin/settings` | Update settings (admin key) |
 
-Admin write endpoints require the `X-Admin-Key` header matching `ADMIN_API_KEY`.
+**Access control.** Every `/api/*` endpoint except `/api/health` and `/api/session` requires
+either the dashboard session cookie or an `X-Admin-Key` header matching `ADMIN_API_KEY`. The
+dashboard calls `/api/session` on load to get a signed, `HttpOnly`, `SameSite=Strict` cookie
+(valid 12 hours), so direct calls like `curl /api/trades` return `401`. Endpoints marked
+"admin key" always need the header. Interactive docs (`/docs`, `/openapi.json`) are disabled,
+and there is no CORS, so other websites can't call the API from a visitor's browser.
+
+This stops casual and scripted access but is not a login: anyone who opens the dashboard can
+still see the data it displays. For scripts, send the admin key:
+
+```bash
+curl -H "X-Admin-Key: $ADMIN_API_KEY" "http://localhost:8000/api/daily-pnl?limit=365"
+```
 
 ## Configuration
 

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import { api } from "../api/client";
+import { api, getAdminKey } from "../api/client";
+import { AdminRequired } from "../components/AdminRequired";
 import { DateFilter } from "../components/DateFilter";
 import { PageSkeleton } from "../components/Skeleton";
 import type { Event } from "../types";
@@ -19,9 +20,11 @@ export function EventsPage() {
   const [eventType, setEventType] = useState("");
   const [events, setEvents] = useState<Event[]>([]);
   const [error, setError] = useState("");
-  const [loading, setLoading] = useState(true);
+  const hasAdminKey = !!getAdminKey();
+  const [loading, setLoading] = useState(hasAdminKey);
 
   const load = useCallback(async () => {
+    if (!hasAdminKey) return;
     setLoading(true);
     setError("");
     try {
@@ -35,11 +38,22 @@ export function EventsPage() {
     } finally {
       setLoading(false);
     }
-  }, [date, eventType]);
+  }, [date, eventType, hasAdminKey]);
 
   useEffect(() => {
     load();
   }, [load]);
+
+  if (!hasAdminKey) {
+    return (
+      <>
+        <div className="page-header">
+          <h2>Events &amp; Briefings</h2>
+        </div>
+        <AdminRequired what="Agent events and briefings" />
+      </>
+    );
+  }
 
   if (loading && !events.length) return <PageSkeleton />;
 
